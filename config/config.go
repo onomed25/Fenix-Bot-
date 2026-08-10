@@ -53,6 +53,7 @@ type config struct {
 	DisableLink    bool         `envconfig:"DISABLE_LINK" default:"false"`
 	FenixFlixAPIURL string      `envconfig:"FENIXFLIX_API_URL" default:""`
 	FenixFlixPassword string    `envconfig:"FENIXFLIX_PASSWORD" default:""`
+	StreamOnly     bool         `envconfig:"STREAM_ONLY" default:"false"`
 	MultiTokens    []string
 
 	// stream specific config
@@ -93,6 +94,7 @@ func SetFlagsFromConfig(cmd *cobra.Command) {
 	cmd.Flags().String("user-session", ValueOf.UserSession, "Pyrogram user session")
 	cmd.Flags().Bool("use-public-ip", ValueOf.UsePublicIP, "Use public IP instead of local IP")
 	cmd.Flags().Bool("disable-link", ValueOf.DisableLink, "Disable link generation and forwarding for files")
+	cmd.Flags().Bool("stream-only", ValueOf.StreamOnly, "Run in stream-only mode (disable Telegram handlers)")
 	cmd.Flags().String("fenixflix-api-url", ValueOf.FenixFlixAPIURL, "FenixFlix API upload URL")
 	cmd.Flags().String("fenixflix-password", ValueOf.FenixFlixPassword, "FenixFlix upload password")
 	cmd.Flags().String("multi-token-txt-file", "", "Multi token txt file (Not implemented)")
@@ -150,6 +152,10 @@ func (c *config) loadConfigFromArgs(log *zap.Logger, cmd *cobra.Command) {
 	disableLink, _ := cmd.Flags().GetBool("disable-link")
 	if disableLink {
 		os.Setenv("DISABLE_LINK", strconv.FormatBool(disableLink))
+	}
+	streamOnly, _ := cmd.Flags().GetBool("stream-only")
+	if streamOnly {
+		os.Setenv("STREAM_ONLY", strconv.FormatBool(streamOnly))
 	}
 	fenixflixAPIURL, _ := cmd.Flags().GetString("fenixflix-api-url")
 	if fenixflixAPIURL != "" {
