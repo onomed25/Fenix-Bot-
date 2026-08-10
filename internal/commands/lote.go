@@ -237,7 +237,11 @@ func HandleLoteMessage(ctx *ext.Context, u *ext.Update) (bool, error) {
 			sendAudioPrompt(ctx, u, state.Title, state.ImdbID)
 		} else {
 			results, err := queryCinemetaCatalog(state.Type, text)
-			if err != nil || len(results) == 0 {
+			if err != nil {
+				sendLoteResponse(ctx, u, fmt.Sprintf("Erro ao buscar no Cinemeta: %s. Tente novamente:", err.Error()), nil)
+				return true, nil
+			}
+			if len(results) == 0 {
 				sendLoteResponse(ctx, u, "Nenhum resultado encontrado. Digite outro nome para buscar novamente:", nil)
 				return true, nil
 			}
@@ -742,11 +746,22 @@ func queryCinemetaCatalog(contentType, query string) ([]CinemetaSearchResult, er
 	escapedQuery := url.PathEscape(query)
 	apiURL := fmt.Sprintf("https://v3-cinemeta.strem.io/catalog/%s/top/search=%s.json", contentType, escapedQuery)
 
-	resp, err := http.Get(apiURL)
+	client := &http.Client{}
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %s", resp.Status)
+	}
 
 	var result struct {
 		Metas []struct {
@@ -779,11 +794,22 @@ func queryCinemetaCatalog(contentType, query string) ([]CinemetaSearchResult, er
 func fetchCinemetaDetails(contentType, imdbID string) (string, error) {
 	apiURL := fmt.Sprintf("https://v3-cinemeta.strem.io/meta/%s/%s.json", contentType, imdbID)
 
-	resp, err := http.Get(apiURL)
+	client := &http.Client{}
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("HTTP %s", resp.Status)
+	}
 
 	var result struct {
 		Meta struct {
