@@ -140,10 +140,6 @@ func (m *command) LoadLote(dispatcher dispatcher.Dispatcher) {
 }
 
 func HandleLoteMessage(ctx *ext.Context, u *ext.Update) (bool, error) {
-	if config.ValueOf.DisableLink {
-		return false, nil
-	}
-
 	if u.EffectiveMessage != nil && u.EffectiveMessage.Out {
 		return false, nil
 	}
@@ -377,10 +373,6 @@ func HandleLoteMessage(ctx *ext.Context, u *ext.Update) (bool, error) {
 }
 
 func startLote(ctx *ext.Context, u *ext.Update) error {
-	if config.ValueOf.DisableLink {
-		return dispatcher.EndGroups
-	}
-
 	chatId := u.EffectiveChat().GetID()
 	peerChatId := ctx.PeerStorage.GetPeerById(chatId)
 	if peerChatId.Type != int(storage.TypeUser) {
@@ -415,9 +407,6 @@ func startLote(ctx *ext.Context, u *ext.Update) error {
 }
 
 func concluirLote(ctx *ext.Context, u *ext.Update) error {
-	if config.ValueOf.DisableLink {
-		return dispatcher.EndGroups
-	}
 	chatId := u.EffectiveChat().GetID()
 	return concluirLoteHelper(ctx, u, chatId)
 }
@@ -500,9 +489,6 @@ func concluirLoteHelper(ctx *ext.Context, u *ext.Update, chatId int64) error {
 }
 
 func cancelarLote(ctx *ext.Context, u *ext.Update) error {
-	if config.ValueOf.DisableLink {
-		return dispatcher.EndGroups
-	}
 	chatId := u.EffectiveChat().GetID()
 	return cancelarLoteHelper(ctx, u, chatId)
 }
@@ -524,9 +510,6 @@ func cancelarLoteHelper(ctx *ext.Context, u *ext.Update, chatId int64) error {
 }
 
 func handleLoteCallbackQuery(ctx *ext.Context, u *ext.Update) error {
-	if config.ValueOf.DisableLink {
-		return nil
-	}
 	chatId := u.EffectiveChat().GetID()
 	query := u.CallbackQuery
 	if query == nil {
