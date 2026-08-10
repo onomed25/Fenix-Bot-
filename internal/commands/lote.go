@@ -140,6 +140,10 @@ func (m *command) LoadLote(dispatcher dispatcher.Dispatcher) {
 }
 
 func HandleLoteMessage(ctx *ext.Context, u *ext.Update) (bool, error) {
+	if u.EffectiveMessage != nil && u.EffectiveMessage.Out {
+		return false, nil
+	}
+
 	chatId := u.EffectiveChat().GetID()
 	peerChatId := ctx.PeerStorage.GetPeerById(chatId)
 	if peerChatId.Type != int(storage.TypeUser) {
