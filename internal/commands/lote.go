@@ -83,6 +83,53 @@ func sendLoteResponse(ctx *ext.Context, u *ext.Update, text string, markup tg.Re
 	return err
 }
 
+func getWaitingFilesMarkup(state *LoteState) tg.ReplyMarkupClass {
+	if state.Type == "movie" {
+		return &tg.ReplyInlineMarkup{
+			Rows: []tg.KeyboardButtonRow{
+				{
+					Buttons: []tg.KeyboardButtonClass{
+						&tg.KeyboardButtonCallback{Text: "📦 Concluir Lote", Data: []byte("lote_concluir")},
+						&tg.KeyboardButtonCallback{Text: "❌ Cancelar", Data: []byte("lote_cancelar")},
+					},
+				},
+			},
+		}
+	}
+
+	// Series/Anime markup
+	row1 := tg.KeyboardButtonRow{
+		Buttons: []tg.KeyboardButtonClass{
+			&tg.KeyboardButtonCallback{Text: fmt.Sprintf("➕ Temp (S%d)", state.Season+1), Data: []byte("lote_inc_season")},
+		},
+	}
+	if state.Season > 1 {
+		row1.Buttons = append(row1.Buttons, &tg.KeyboardButtonCallback{Text: fmt.Sprintf("➖ Temp (S%d)", state.Season-1), Data: []byte("lote_dec_season")})
+	}
+
+	row2 := tg.KeyboardButtonRow{
+		Buttons: []tg.KeyboardButtonClass{
+			&tg.KeyboardButtonCallback{Text: fmt.Sprintf("➕ Ep (E%d)", state.CurrentEp+1), Data: []byte("lote_inc_ep")},
+		},
+	}
+	if state.CurrentEp > 1 {
+		row2.Buttons = append(row2.Buttons, &tg.KeyboardButtonCallback{Text: fmt.Sprintf("➖ Ep (E%d)", state.CurrentEp-1), Data: []byte("lote_dec_ep")})
+	}
+
+	return &tg.ReplyInlineMarkup{
+		Rows: []tg.KeyboardButtonRow{
+			row1,
+			row2,
+			{
+				Buttons: []tg.KeyboardButtonClass{
+					&tg.KeyboardButtonCallback{Text: "📦 Concluir Lote", Data: []byte("lote_concluir")},
+					&tg.KeyboardButtonCallback{Text: "❌ Cancelar", Data: []byte("lote_cancelar")},
+				},
+			},
+		},
+	}
+}
+
 func (m *command) LoadLote(dispatcher dispatcher.Dispatcher) {
 	log := m.log.Named("lote")
 	defer log.Sugar().Info("Loaded")
@@ -117,6 +164,34 @@ func HandleLoteMessage(ctx *ext.Context, u *ext.Update) (bool, error) {
 
 	// If it's a command, let other handlers process it
 	if strings.HasPrefix(text, "/") {
+		if state.Step == 8 && (strings.HasPrefix(text, "/temporada ") || strings.HasPrefix(text, "/episodio ")) {
+			if state.Type != "series" {
+				sendLoteResponse(ctx, u, "Esta opção só é válida para Séries/Animes.", nil)
+				return true, nil
+			}
+			if strings.HasPrefix(text, "/temporada ") {
+				valStr := strings.TrimPrefix(text, "/temporada ")
+				season, err := strconv.Atoi(valStr)
+				if err != nil || season < 1 {
+					sendLoteResponse(ctx, u, "Temporada inválida. Digite um número positivo: (Ex: `/temporada 2`)", nil)
+					return true, nil
+				}
+				state.Season = season
+				sendLoteResponse(ctx, u, fmt.Sprintf("Temporada alterada para **%d**.\nPróximo episódio esperado: **S%dE%d**.", state.Season, state.Season, state.CurrentEp), getWaitingFilesMarkup(state))
+				return true, nil
+			}
+			if strings.HasPrefix(text, "/episodio ") {
+				valStr := strings.TrimPrefix(text, "/episodio ")
+				ep, err := strconv.Atoi(valStr)
+				if err != nil || ep < 1 {
+					sendLoteResponse(ctx, u, "Episódio inválido. Digite um número positivo: (Ex: `/episodio 5`)", nil)
+					return true, nil
+				}
+				state.CurrentEp = ep
+				sendLoteResponse(ctx, u, fmt.Sprintf("Episódio atual alterado para **%d**.\nPróximo episódio esperado: **S%dE%d**.", state.CurrentEp, state.Season, state.CurrentEp), getWaitingFilesMarkup(state))
+				return true, nil
+			}
+		}
 		return false, nil
 	}
 
@@ -218,7 +293,7 @@ func HandleLoteMessage(ctx *ext.Context, u *ext.Update) (bool, error) {
 			state.MovieStreams = []StreamObj{}
 			state.Step = 8
 			msgStr := fmt.Sprintf("✅ **Configurações Concluídas!**\n\n- **Colaborador**: %s\n- **Tipo**: Filme\n- **Título**: %s (%s)\n- **Áudio**: %s\n\nAgora, **envie os arquivos de vídeo** para este lote.\n\nQuando terminar, envie `/concluido`.", state.Colaborador, state.Title, state.ImdbID, state.Audio)
-			sendLoteResponse(ctx, u, msgStr, nil)
+			sendLoteResponse(ctx, u, msgStr, getWaitingFilesMarkup(state))
 		}
 		return true, nil
 
@@ -243,19 +318,19 @@ func HandleLoteMessage(ctx *ext.Context, u *ext.Update) (bool, error) {
 		state.SeriesStreams = make(map[string]map[string][]StreamObj)
 		state.Step = 8
 		msgStr := fmt.Sprintf("✅ **Configurações Concluídas!**\n\n- **Colaborador**: %s\n- **Tipo**: Série\n- **Título**: %s (%s)\n- **Áudio**: %s\n- **Temporada**: %d\n- **Episódio Inicial**: %d\n\nAgora, **envie os arquivos de vídeo em ordem**.\nO número do episódio será incrementado a cada envio.\n\nQuando terminar, envie `/concluido`.", state.Colaborador, state.Title, state.ImdbID, state.Audio, state.Season, state.CurrentEp)
-		sendLoteResponse(ctx, u, msgStr, nil)
+		sendLoteResponse(ctx, u, msgStr, getWaitingFilesMarkup(state))
 		return true, nil
 
 	case 8: // Waiting for files
 		supported, err := supportedMediaFilter(u.EffectiveMessage)
 		if err != nil || !supported {
-			sendLoteResponse(ctx, u, "Envie um arquivo de vídeo válido ou digite `/concluido` para fechar o lote.", nil)
+			sendLoteResponse(ctx, u, "Envie um arquivo de vídeo válido ou digite `/concluido` para fechar o lote.", getWaitingFilesMarkup(state))
 			return true, nil
 		}
 
 		link, fileName, err := getStreamLinkForMessage(ctx, u, chatId)
 		if err != nil {
-			sendLoteResponse(ctx, u, fmt.Sprintf("Erro ao processar arquivo: %s", err.Error()), nil)
+			sendLoteResponse(ctx, u, fmt.Sprintf("Erro ao processar arquivo: %s", err.Error()), getWaitingFilesMarkup(state))
 			return true, nil
 		}
 
@@ -269,7 +344,7 @@ func HandleLoteMessage(ctx *ext.Context, u *ext.Update) (bool, error) {
 
 		if state.Type == "movie" {
 			state.MovieStreams = append(state.MovieStreams, streamObj)
-			sendLoteResponse(ctx, u, fmt.Sprintf("🎬 Link de filme adicionado!\n- **Nome**: %s\n- **Qualidade**: %s\n- **URL**: %s\n\nEnvie outro arquivo ou `/concluido` para terminar.", fileName, quality, link), nil)
+			sendLoteResponse(ctx, u, fmt.Sprintf("🎬 Link de filme adicionado!\n- **Nome**: %s\n- **Qualidade**: %s\n- **URL**: %s\n\nEnvie outro arquivo ou clique em **Concluir Lote**.", fileName, quality, link), getWaitingFilesMarkup(state))
 		} else {
 			seasonStr := strconv.Itoa(state.Season)
 			epStr := strconv.Itoa(state.CurrentEp)
@@ -281,7 +356,7 @@ func HandleLoteMessage(ctx *ext.Context, u *ext.Update) (bool, error) {
 
 			oldEp := state.CurrentEp
 			state.CurrentEp++
-			sendLoteResponse(ctx, u, fmt.Sprintf("📺 Episódio %d adicionado!\n- **Nome**: %s\n- **Qualidade**: %s\n- **URL**: %s\n\nPróximo esperado: %d.\nEnvie outro arquivo ou `/concluido`.", oldEp, fileName, quality, link, state.CurrentEp), nil)
+			sendLoteResponse(ctx, u, fmt.Sprintf("📺 Episódio %d adicionado!\n- **Nome**: %s\n- **Qualidade**: %s\n- **URL**: %s\n\nPróximo esperado: %d.\nEnvie outro arquivo ou clique em **Concluir Lote**.", oldEp, fileName, quality, link, state.CurrentEp), getWaitingFilesMarkup(state))
 		}
 		return true, nil
 	}
@@ -325,7 +400,10 @@ func startLote(ctx *ext.Context, u *ext.Update) error {
 
 func concluirLote(ctx *ext.Context, u *ext.Update) error {
 	chatId := u.EffectiveChat().GetID()
+	return concluirLoteHelper(ctx, u, chatId)
+}
 
+func concluirLoteHelper(ctx *ext.Context, u *ext.Update, chatId int64) error {
 	loteMutex.Lock()
 	state, exists := loteStates[chatId]
 	loteMutex.Unlock()
@@ -404,7 +482,10 @@ func concluirLote(ctx *ext.Context, u *ext.Update) error {
 
 func cancelarLote(ctx *ext.Context, u *ext.Update) error {
 	chatId := u.EffectiveChat().GetID()
+	return cancelarLoteHelper(ctx, u, chatId)
+}
 
+func cancelarLoteHelper(ctx *ext.Context, u *ext.Update, chatId int64) error {
 	loteMutex.Lock()
 	_, exists := loteStates[chatId]
 	if exists {
@@ -502,8 +583,28 @@ func handleLoteCallbackQuery(ctx *ext.Context, u *ext.Update) error {
 				state.MovieStreams = []StreamObj{}
 				state.Step = 8
 				msgStr := fmt.Sprintf("✅ **Configurações Concluídas!**\n\n- **Colaborador**: %s\n- **Tipo**: Filme\n- **Título**: %s (%s)\n- **Áudio**: %s\n\nAgora, **envie os arquivos de vídeo** para este lote.\n\nQuando terminar, envie `/concluido`.", state.Colaborador, state.Title, state.ImdbID, state.Audio)
-				sendLoteResponse(ctx, u, msgStr, nil)
+				sendLoteResponse(ctx, u, msgStr, getWaitingFilesMarkup(state))
 			}
+		}
+	case data == "lote_concluir":
+		concluirLoteHelper(ctx, u, chatId)
+	case data == "lote_cancelar":
+		cancelarLoteHelper(ctx, u, chatId)
+	case data == "lote_inc_season":
+		state.Season++
+		sendLoteResponse(ctx, u, fmt.Sprintf("Temporada alterada para **%d**.\nPróximo episódio esperado: **S%dE%d**.", state.Season, state.Season, state.CurrentEp), getWaitingFilesMarkup(state))
+	case data == "lote_dec_season":
+		if state.Season > 1 {
+			state.Season--
+			sendLoteResponse(ctx, u, fmt.Sprintf("Temporada alterada para **%d**.\nPróximo episódio esperado: **S%dE%d**.", state.Season, state.Season, state.CurrentEp), getWaitingFilesMarkup(state))
+		}
+	case data == "lote_inc_ep":
+		state.CurrentEp++
+		sendLoteResponse(ctx, u, fmt.Sprintf("Próximo episódio esperado alterado para **%d**.\nEsperado: **S%dE%d**.", state.CurrentEp, state.Season, state.CurrentEp), getWaitingFilesMarkup(state))
+	case data == "lote_dec_ep":
+		if state.CurrentEp > 1 {
+			state.CurrentEp--
+			sendLoteResponse(ctx, u, fmt.Sprintf("Próximo episódio esperado alterado para **%d**.\nEsperado: **S%dE%d**.", state.CurrentEp, state.Season, state.CurrentEp), getWaitingFilesMarkup(state))
 		}
 	}
 
