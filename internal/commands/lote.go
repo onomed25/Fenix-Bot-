@@ -705,7 +705,7 @@ func getStreamLinkForMessage(ctx *ext.Context, u *ext.Update, chatId int64) (str
 }
 
 func detectQuality(media tg.MessageMediaClass, fileName string) string {
-	if docMedia, ok := media.(*tg.MessageMediaDocument); ok {
+	if docMedia, ok := media.(*tg.MessageMediaDocument); ok && docMedia.Document != nil {
 		if doc, ok := docMedia.Document.AsNotEmpty(); ok {
 			for _, attr := range doc.Attributes {
 				if video, ok := attr.(*tg.DocumentAttributeVideo); ok {
