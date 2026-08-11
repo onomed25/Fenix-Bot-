@@ -181,6 +181,7 @@ func HandleLoteMessage(ctx *ext.Context, u *ext.Update) (bool, error) {
 					return true, nil
 				}
 				state.Season = season
+				state.CurrentEp = 1
 				sendLoteResponse(ctx, u, fmt.Sprintf("Temporada alterada para **%d**.\nPróximo episódio esperado: **S%dE%d**.", state.Season, state.Season, state.CurrentEp), getWaitingFilesMarkup(state))
 				return true, nil
 			}
@@ -600,10 +601,12 @@ func handleLoteCallbackQuery(ctx *ext.Context, u *ext.Update) error {
 		cancelarLoteHelper(ctx, u, chatId)
 	case data == "lote_inc_season":
 		state.Season++
+		state.CurrentEp = 1
 		sendLoteResponse(ctx, u, fmt.Sprintf("Temporada alterada para **%d**.\nPróximo episódio esperado: **S%dE%d**.", state.Season, state.Season, state.CurrentEp), getWaitingFilesMarkup(state))
 	case data == "lote_dec_season":
 		if state.Season > 1 {
 			state.Season--
+			state.CurrentEp = 1
 			sendLoteResponse(ctx, u, fmt.Sprintf("Temporada alterada para **%d**.\nPróximo episódio esperado: **S%dE%d**.", state.Season, state.Season, state.CurrentEp), getWaitingFilesMarkup(state))
 		}
 	case data == "lote_inc_ep":
