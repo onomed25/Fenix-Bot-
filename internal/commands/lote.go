@@ -45,6 +45,7 @@ type LoteState struct {
 	ImdbID           string
 	Title            string
 	Audio            string
+	EditingAudio     bool
 	Season           int
 	CurrentEp        int
 	AutoDetectSeason bool
@@ -211,6 +212,68 @@ func DetectSeasonAndEpisode(fileName, caption string) (season int, episode int, 
 	return season, episode, false
 }
 
+func getSearchBackMarkup() *tg.ReplyInlineMarkup {
+	return &tg.ReplyInlineMarkup{
+		Rows: []tg.KeyboardButtonRow{
+			{
+				Buttons: []tg.KeyboardButtonClass{
+					&tg.KeyboardButtonCallback{
+						Text: "🔙 Voltar (Tipo)",
+						Data: []byte("lote_back_to_type"),
+					},
+					&tg.KeyboardButtonCallback{
+						Text: "❌ Cancelar",
+						Data: []byte("lote_cancelar"),
+					},
+				},
+			},
+		},
+	}
+}
+
+func sendSearchPrompt(ctx *ext.Context, u *ext.Update, contentType string) error {
+	typeName := "Série / Anime"
+	if contentType == "movie" {
+		typeName = "Filme"
+	}
+	return sendLoteResponse(ctx, u, fmt.Sprintf("Tipo configurado: **%s**.\n\nAgora digite o Nome para buscar ou envie o ID IMDb (começando com 'tt', ex: `tt1234567`):", typeName), getSearchBackMarkup())
+}
+
+func sendMatchSelectionPrompt(ctx *ext.Context, u *ext.Update, results []CinemetaSearchResult) error {
+	rows := []tg.KeyboardButtonRow{}
+	for _, r := range results {
+		rows = append(rows, tg.KeyboardButtonRow{
+			Buttons: []tg.KeyboardButtonClass{
+				&tg.KeyboardButtonCallback{
+					Text: fmt.Sprintf("%s (%s)", r.Name, r.Year),
+					Data: []byte("lote_sel_" + r.ID),
+				},
+			},
+		})
+	}
+	rows = append(rows, tg.KeyboardButtonRow{
+		Buttons: []tg.KeyboardButtonClass{
+			&tg.KeyboardButtonCallback{
+				Text: "🔍 Digitar ID IMDb / Nova Busca",
+				Data: []byte("lote_back_to_search"),
+			},
+		},
+	})
+	rows = append(rows, tg.KeyboardButtonRow{
+		Buttons: []tg.KeyboardButtonClass{
+			&tg.KeyboardButtonCallback{
+				Text: "🔙 Voltar",
+				Data: []byte("lote_back_to_type"),
+			},
+			&tg.KeyboardButtonCallback{
+				Text: "❌ Cancelar",
+				Data: []byte("lote_cancelar"),
+			},
+		},
+	})
+	return sendLoteResponse(ctx, u, "Escolha o item correto clicando em um dos botões abaixo, ou digite o ID IMDb (ex: `tt1234567`) ou um novo nome:", &tg.ReplyInlineMarkup{Rows: rows})
+}
+
 func getSkipSeasonMarkup() *tg.ReplyInlineMarkup {
 	return &tg.ReplyInlineMarkup{
 		Rows: []tg.KeyboardButtonRow{
@@ -219,6 +282,18 @@ func getSkipSeasonMarkup() *tg.ReplyInlineMarkup {
 					&tg.KeyboardButtonCallback{
 						Text: "⏩ Deixar em branco (Auto-detectar)",
 						Data: []byte("lote_skip_season"),
+					},
+				},
+			},
+			{
+				Buttons: []tg.KeyboardButtonClass{
+					&tg.KeyboardButtonCallback{
+						Text: "🔙 Voltar (Alterar Áudio)",
+						Data: []byte("lote_back_to_audio"),
+					},
+					&tg.KeyboardButtonCallback{
+						Text: "❌ Cancelar",
+						Data: []byte("lote_cancelar"),
 					},
 				},
 			},
@@ -238,6 +313,18 @@ func getSkipEpMarkup() *tg.ReplyInlineMarkup {
 					&tg.KeyboardButtonCallback{
 						Text: "⏩ Deixar em branco (Auto-detectar)",
 						Data: []byte("lote_skip_ep"),
+					},
+				},
+			},
+			{
+				Buttons: []tg.KeyboardButtonClass{
+					&tg.KeyboardButtonCallback{
+						Text: "🔙 Voltar (Temporada)",
+						Data: []byte("lote_back_to_season"),
+					},
+					&tg.KeyboardButtonCallback{
+						Text: "❌ Cancelar",
+						Data: []byte("lote_cancelar"),
 					},
 				},
 			},
@@ -280,16 +367,113 @@ func sendLoteResponse(ctx *ext.Context, u *ext.Update, text string, markup tg.Re
 	return err
 }
 
+func applyAudioUpdate(state *LoteState, oldAudio, newAudio string) {
+	state.Audio = newAudio
+	if state.Type == "movie" {
+		for i := range state.MovieStreams {
+			if oldAudio != "" && strings.Contains(state.MovieStreams[i].Name, oldAudio) {
+				state.MovieStreams[i].Name = strings.Replace(state.MovieStreams[i].Name, oldAudio, newAudio, 1)
+			} else {
+				parts := strings.Split(state.MovieStreams[i].Name, "\n")
+				if len(parts) > 1 {
+					state.MovieStreams[i].Name = fmt.Sprintf("%s\n%s", newAudio, strings.Join(parts[1:], "\n"))
+				} else {
+					state.MovieStreams[i].Name = newAudio
+				}
+			}
+		}
+	} else if state.Type == "series" && state.SeriesStreams != nil {
+		for seasonKey, epMap := range state.SeriesStreams {
+			for epKey, streams := range epMap {
+				for i := range streams {
+					if oldAudio != "" && strings.Contains(streams[i].Name, oldAudio) {
+						streams[i].Name = strings.Replace(streams[i].Name, oldAudio, newAudio, 1)
+					} else {
+						parts := strings.Split(streams[i].Name, "\n")
+						if len(parts) > 1 {
+							streams[i].Name = fmt.Sprintf("%s\n%s", newAudio, strings.Join(parts[1:], "\n"))
+						} else {
+							streams[i].Name = newAudio
+						}
+					}
+				}
+				state.SeriesStreams[seasonKey][epKey] = streams
+			}
+		}
+	}
+}
+
+func handleVoltar(ctx *ext.Context, u *ext.Update, state *LoteState) {
+	switch state.Step {
+	case 2:
+		sendLoteResponse(ctx, u, "Você já está no início da configuração. Escolha o tipo de conteúdo ou use `/cancelar` para sair.", nil)
+	case 3:
+		state.Step = 2
+		sendTypePrompt(ctx, u)
+	case 4:
+		state.Step = 3
+		sendSearchPrompt(ctx, u, state.Type)
+	case 5:
+		if state.EditingAudio {
+			state.EditingAudio = false
+			state.Step = 8
+			sendLoteResponse(ctx, u, fmt.Sprintf("Alteração cancelada. Áudio mantido: **%s**.\n\nEnvie os arquivos de vídeo ou clique em **Concluir Lote**.", state.Audio), getWaitingFilesMarkup(state))
+			return
+		}
+		if len(state.SearchResults) > 0 {
+			state.Step = 4
+			sendMatchSelectionPrompt(ctx, u, state.SearchResults)
+		} else {
+			state.Step = 3
+			sendSearchPrompt(ctx, u, state.Type)
+		}
+	case 6:
+		state.Step = 5
+		state.EditingAudio = false
+		sendAudioPrompt(ctx, u, state.Title, state.ImdbID, false)
+	case 7:
+		state.Step = 6
+		sendSeasonPrompt(ctx, u)
+	case 8:
+		hasFiles := false
+		if state.Type == "movie" && len(state.MovieStreams) > 0 {
+			hasFiles = true
+		} else if state.Type == "series" && len(state.SeriesStreams) > 0 {
+			hasFiles = true
+		}
+
+		if hasFiles {
+			sendLoteResponse(ctx, u, "Já existem arquivos adicionados neste lote.\n\n- Para alterar o áudio, clique no botão **🔊 Alterar Áudio** ou envie `/audio`.\n- Para alterar temporada/episódio, use `/temporada <N>` ou `/episodio <N>`.\n- Para cancelar o lote, envie `/cancelar`.", getWaitingFilesMarkup(state))
+		} else {
+			if state.Type == "series" {
+				state.Step = 7
+				sendEpPrompt(ctx, u)
+			} else {
+				state.Step = 5
+				state.EditingAudio = false
+				sendAudioPrompt(ctx, u, state.Title, state.ImdbID, false)
+			}
+		}
+	}
+}
+
 func getWaitingFilesMarkup(state *LoteState) tg.ReplyMarkupClass {
 	if state.Type == "movie" {
+		bottomRow := tg.KeyboardButtonRow{}
+		if len(state.MovieStreams) == 0 {
+			bottomRow.Buttons = append(bottomRow.Buttons, &tg.KeyboardButtonCallback{Text: "🔙 Voltar", Data: []byte("lote_back_from_files")})
+		}
+		bottomRow.Buttons = append(bottomRow.Buttons, &tg.KeyboardButtonCallback{Text: "❌ Cancelar", Data: []byte("lote_cancelar")})
+
 		return &tg.ReplyInlineMarkup{
 			Rows: []tg.KeyboardButtonRow{
 				{
 					Buttons: []tg.KeyboardButtonClass{
+						&tg.KeyboardButtonCallback{Text: "🔊 Alterar Áudio", Data: []byte("lote_change_audio")},
 						&tg.KeyboardButtonCallback{Text: "📦 Concluir Lote", Data: []byte("lote_concluir")},
-						&tg.KeyboardButtonCallback{Text: "❌ Cancelar", Data: []byte("lote_cancelar")},
 					},
 				},
+				bottomRow,
 			},
 		}
 	}
@@ -313,16 +497,25 @@ func getWaitingFilesMarkup(state *LoteState) tg.ReplyMarkupClass {
 		row2.Buttons = append(row2.Buttons, &tg.KeyboardButtonCallback{Text: fmt.Sprintf("➖ Ep (E%d)", state.CurrentEp-1), Data: []byte("lote_dec_ep")})
 	}
 
+	row3 := tg.KeyboardButtonRow{
+		Buttons: []tg.KeyboardButtonClass{
+			&tg.KeyboardButtonCallback{Text: "🔊 Alterar Áudio", Data: []byte("lote_change_audio")},
+			&tg.KeyboardButtonCallback{Text: "📦 Concluir Lote", Data: []byte("lote_concluir")},
+		},
+	}
+
+	row4 := tg.KeyboardButtonRow{}
+	if len(state.SeriesStreams) == 0 {
+		row4.Buttons = append(row4.Buttons, &tg.KeyboardButtonCallback{Text: "🔙 Voltar", Data: []byte("lote_back_from_files")})
+	}
+	row4.Buttons = append(row4.Buttons, &tg.KeyboardButtonCallback{Text: "❌ Cancelar", Data: []byte("lote_cancelar")})
+
 	return &tg.ReplyInlineMarkup{
 		Rows: []tg.KeyboardButtonRow{
 			row1,
 			row2,
-			{
-				Buttons: []tg.KeyboardButtonClass{
-					&tg.KeyboardButtonCallback{Text: "📦 Concluir Lote", Data: []byte("lote_concluir")},
-					&tg.KeyboardButtonCallback{Text: "❌ Cancelar", Data: []byte("lote_cancelar")},
-				},
-			},
+			row3,
+			row4,
 		},
 	}
 }
@@ -333,6 +526,8 @@ func (m *command) LoadLote(dispatcher dispatcher.Dispatcher) {
 	dispatcher.AddHandler(handlers.NewCommand("lote", startLote))
 	dispatcher.AddHandler(handlers.NewCommand("concluido", concluirLote))
 	dispatcher.AddHandler(handlers.NewCommand("cancelar", cancelarLote))
+	dispatcher.AddHandler(handlers.NewCommand("voltar", voltarLote))
+	dispatcher.AddHandler(handlers.NewCommand("audio", audioLote))
 	dispatcher.AddHandler(handlers.NewCallbackQuery(filters.CallbackQuery.Prefix("lote_"), handleLoteCallbackQuery))
 }
 
@@ -361,6 +556,24 @@ func HandleLoteMessage(ctx *ext.Context, u *ext.Update) (bool, error) {
 	text := ""
 	if u.EffectiveMessage != nil && u.EffectiveMessage.Text != "" {
 		text = strings.TrimSpace(u.EffectiveMessage.Text)
+	}
+
+	// Commands and text shortcuts
+	if strings.EqualFold(text, "voltar") || text == "/voltar" {
+		handleVoltar(ctx, u, state)
+		return true, nil
+	}
+
+	if strings.EqualFold(text, "cancelar") {
+		cancelarLoteHelper(ctx, u, chatId)
+		return true, nil
+	}
+
+	if (strings.EqualFold(text, "audio") || text == "/audio") && state.Step >= 5 {
+		state.EditingAudio = true
+		state.Step = 5
+		sendAudioPrompt(ctx, u, state.Title, state.ImdbID, true)
+		return true, nil
 	}
 
 	// If it's a command, let other handlers process it
@@ -428,11 +641,11 @@ func HandleLoteMessage(ctx *ext.Context, u *ext.Update) (bool, error) {
 		if text == "1" {
 			state.Type = "series"
 			state.Step = 3
-			sendLoteResponse(ctx, u, "Tipo configurado: Série / Anime.\n\nAgora digite o Nome ou o ID IMDb (começando com 'tt'):", nil)
+			sendSearchPrompt(ctx, u, "series")
 		} else if text == "2" {
 			state.Type = "movie"
 			state.Step = 3
-			sendLoteResponse(ctx, u, "Tipo configurado: Filme.\n\nAgora digite o Nome ou o ID IMDb (começando com 'tt'):", nil)
+			sendSearchPrompt(ctx, u, "movie")
 		} else {
 			sendLoteResponse(ctx, u, "Opção inválida. Por favor, responda com:\n1. Série / Anime\n2. Filme", nil)
 		}
@@ -442,51 +655,67 @@ func HandleLoteMessage(ctx *ext.Context, u *ext.Update) (bool, error) {
 		if strings.HasPrefix(text, "tt") {
 			title, err := fetchCinemetaDetails(state.Type, text)
 			if err != nil {
-				sendLoteResponse(ctx, u, "Não encontrei esse ID IMDb no Cinemeta. Digite o nome para buscar novamente:", nil)
+				sendLoteResponse(ctx, u, "Não encontrei esse ID IMDb no Cinemeta. Digite o nome ou outro ID para buscar novamente:", getSearchBackMarkup())
 				return true, nil
 			}
 			state.ImdbID = text
 			state.Title = title
+			state.SearchResults = nil
 			state.Step = 5
-			sendAudioPrompt(ctx, u, state.Title, state.ImdbID)
+			sendAudioPrompt(ctx, u, state.Title, state.ImdbID, false)
 		} else {
 			results, err := queryCinemetaCatalog(state.Type, text)
 			if err != nil {
-				sendLoteResponse(ctx, u, fmt.Sprintf("Erro ao buscar no Cinemeta: %s. Tente novamente:", err.Error()), nil)
+				sendLoteResponse(ctx, u, fmt.Sprintf("Erro ao buscar no Cinemeta: %s. Tente novamente ou envie o ID IMDb (começando com 'tt'):", err.Error()), getSearchBackMarkup())
 				return true, nil
 			}
 			if len(results) == 0 {
-				sendLoteResponse(ctx, u, "Nenhum resultado encontrado. Digite outro nome para buscar novamente:", nil)
+				sendLoteResponse(ctx, u, "Nenhum resultado encontrado. Digite outro nome ou envie o ID IMDb (começando com 'tt', ex: tt1234567):", getSearchBackMarkup())
 				return true, nil
 			}
 			state.SearchResults = results
-			rows := []tg.KeyboardButtonRow{}
-			for _, r := range results {
-				rows = append(rows, tg.KeyboardButtonRow{
-					Buttons: []tg.KeyboardButtonClass{
-						&tg.KeyboardButtonCallback{
-							Text: fmt.Sprintf("%s (%s)", r.Name, r.Year),
-							Data: []byte("lote_sel_" + r.ID),
-						},
-					},
-				})
-			}
 			state.Step = 4
-			sendLoteResponse(ctx, u, "Escolha o item correto clicando em um dos botões abaixo:", &tg.ReplyInlineMarkup{Rows: rows})
+			sendMatchSelectionPrompt(ctx, u, results)
 		}
 		return true, nil
 
-	case 4: // Select match
-		idx, err := strconv.Atoi(text)
-		if err != nil || idx < 1 || idx > len(state.SearchResults) {
-			sendLoteResponse(ctx, u, fmt.Sprintf("Opção inválida. Digite um número de 1 a %d:", len(state.SearchResults)), nil)
+	case 4: // Select match or type IMDb ID / new search
+		if strings.HasPrefix(text, "tt") {
+			title, err := fetchCinemetaDetails(state.Type, text)
+			if err != nil {
+				sendLoteResponse(ctx, u, "Não encontrei esse ID IMDb no Cinemeta. Digite outro ID ou nome para buscar novamente:", getSearchBackMarkup())
+				return true, nil
+			}
+			state.ImdbID = text
+			state.Title = title
+			state.SearchResults = nil
+			state.Step = 5
+			sendAudioPrompt(ctx, u, state.Title, state.ImdbID, false)
 			return true, nil
 		}
-		selected := state.SearchResults[idx-1]
-		state.ImdbID = selected.ID
-		state.Title = selected.Name
-		state.Step = 5
-		sendAudioPrompt(ctx, u, state.Title, state.ImdbID)
+
+		idx, err := strconv.Atoi(text)
+		if err == nil && idx >= 1 && idx <= len(state.SearchResults) {
+			selected := state.SearchResults[idx-1]
+			state.ImdbID = selected.ID
+			state.Title = selected.Name
+			state.Step = 5
+			sendAudioPrompt(ctx, u, state.Title, state.ImdbID, false)
+			return true, nil
+		}
+
+		// User typed a new name query!
+		results, err := queryCinemetaCatalog(state.Type, text)
+		if err != nil {
+			sendLoteResponse(ctx, u, fmt.Sprintf("Erro ao buscar no Cinemeta: %s. Tente novamente ou envie o ID IMDb (começando com 'tt'):", err.Error()), getSearchBackMarkup())
+			return true, nil
+		}
+		if len(results) == 0 {
+			sendLoteResponse(ctx, u, "Nenhum resultado encontrado para essa busca. Digite outro nome ou envie o ID IMDb (começando com 'tt', ex: tt1234567):", getSearchBackMarkup())
+			return true, nil
+		}
+		state.SearchResults = results
+		sendMatchSelectionPrompt(ctx, u, results)
 		return true, nil
 
 	case 5: // Selecting audio
@@ -502,13 +731,24 @@ func HandleLoteMessage(ctx *ext.Context, u *ext.Update) (bool, error) {
 			sendLoteResponse(ctx, u, "Opção inválida. Escolha de 1 a 5:\n1. Dublado\n2. Legendado\n3. Dual Áudio\n4. Português (PT-BR)\n5. English", nil)
 			return true, nil
 		}
+		oldAudio := state.Audio
 		state.Audio = audio
+
+		if state.EditingAudio {
+			state.EditingAudio = false
+			state.Step = 8
+			applyAudioUpdate(state, oldAudio, state.Audio)
+			sendLoteResponse(ctx, u, fmt.Sprintf("🔊 Áudio alterado com sucesso para: **%s**!\n\nEnvie os arquivos de vídeo ou clique em **Concluir Lote**.", state.Audio), getWaitingFilesMarkup(state))
+			return true, nil
+		}
 
 		if state.Type == "series" {
 			state.Step = 6
 			sendSeasonPrompt(ctx, u)
 		} else {
-			state.MovieStreams = []StreamObj{}
+			if state.MovieStreams == nil {
+				state.MovieStreams = []StreamObj{}
+			}
 			state.Step = 8
 			msgStr := fmt.Sprintf("✅ **Configurações Concluídas!**\n\n- **Colaborador**: %s\n- **Tipo**: Filme\n- **Título**: %s (%s)\n- **Áudio**: %s\n\nAgora, **envie os arquivos de vídeo** para este lote.\n\nQuando terminar, envie `/concluido`.", state.Colaborador, state.Title, state.ImdbID, state.Audio)
 			sendLoteResponse(ctx, u, msgStr, getWaitingFilesMarkup(state))
@@ -774,6 +1014,59 @@ func cancelarLoteHelper(ctx *ext.Context, u *ext.Update, chatId int64) error {
 	return dispatcher.EndGroups
 }
 
+func voltarLote(ctx *ext.Context, u *ext.Update) error {
+	chatId := u.EffectiveChat().GetID()
+	peerChatId := ctx.PeerStorage.GetPeerById(chatId)
+	if peerChatId.Type != int(storage.TypeUser) {
+		return dispatcher.EndGroups
+	}
+
+	loteMutex.Lock()
+	state, exists := loteStates[chatId]
+	loteMutex.Unlock()
+
+	if !exists {
+		sendLoteResponse(ctx, u, "Você não tem nenhum lote ativo no momento.", nil)
+		return dispatcher.EndGroups
+	}
+
+	state.Mutex.Lock()
+	defer state.Mutex.Unlock()
+
+	handleVoltar(ctx, u, state)
+	return dispatcher.EndGroups
+}
+
+func audioLote(ctx *ext.Context, u *ext.Update) error {
+	chatId := u.EffectiveChat().GetID()
+	peerChatId := ctx.PeerStorage.GetPeerById(chatId)
+	if peerChatId.Type != int(storage.TypeUser) {
+		return dispatcher.EndGroups
+	}
+
+	loteMutex.Lock()
+	state, exists := loteStates[chatId]
+	loteMutex.Unlock()
+
+	if !exists {
+		sendLoteResponse(ctx, u, "Você não tem nenhum lote ativo no momento.", nil)
+		return dispatcher.EndGroups
+	}
+
+	state.Mutex.Lock()
+	defer state.Mutex.Unlock()
+
+	if state.Step < 5 {
+		sendLoteResponse(ctx, u, "Você ainda não definiu o título da mídia.", nil)
+		return dispatcher.EndGroups
+	}
+
+	state.EditingAudio = true
+	state.Step = 5
+	sendAudioPrompt(ctx, u, state.Title, state.ImdbID, true)
+	return dispatcher.EndGroups
+}
+
 func handleLoteCallbackQuery(ctx *ext.Context, u *ext.Update) error {
 	chatId := u.EffectiveChat().GetID()
 	query := u.CallbackQuery
@@ -817,13 +1110,61 @@ func handleLoteCallbackQuery(ctx *ext.Context, u *ext.Update) error {
 		if state.Step == 2 {
 			state.Type = "series"
 			state.Step = 3
-			sendLoteResponse(ctx, u, "Tipo configurado: Série / Anime.\n\nAgora digite o Nome ou o ID IMDb (começando com 'tt'):", nil)
+			sendSearchPrompt(ctx, u, "series")
 		}
 	case data == "lote_type_movie":
 		if state.Step == 2 {
 			state.Type = "movie"
 			state.Step = 3
-			sendLoteResponse(ctx, u, "Tipo configurado: Filme.\n\nAgora digite o Nome ou o ID IMDb (começando com 'tt'):", nil)
+			sendSearchPrompt(ctx, u, "movie")
+		}
+	case data == "lote_back_to_type":
+		state.Step = 2
+		sendTypePrompt(ctx, u)
+	case data == "lote_back_to_search":
+		state.Step = 3
+		sendSearchPrompt(ctx, u, state.Type)
+	case data == "lote_back_from_audio":
+		if len(state.SearchResults) > 0 {
+			state.Step = 4
+			sendMatchSelectionPrompt(ctx, u, state.SearchResults)
+		} else {
+			state.Step = 3
+			sendSearchPrompt(ctx, u, state.Type)
+		}
+	case data == "lote_back_to_audio":
+		state.Step = 5
+		state.EditingAudio = false
+		sendAudioPrompt(ctx, u, state.Title, state.ImdbID, false)
+	case data == "lote_back_to_season":
+		state.Step = 6
+		sendSeasonPrompt(ctx, u)
+	case data == "lote_change_audio":
+		state.EditingAudio = true
+		state.Step = 5
+		sendAudioPrompt(ctx, u, state.Title, state.ImdbID, true)
+	case data == "lote_cancel_audio_change":
+		state.EditingAudio = false
+		state.Step = 8
+		sendLoteResponse(ctx, u, fmt.Sprintf("Alteração cancelada. Áudio mantido: **%s**.\n\nEnvie os arquivos de vídeo ou clique em **Concluir Lote**.", state.Audio), getWaitingFilesMarkup(state))
+	case data == "lote_back_from_files":
+		if state.Step == 8 {
+			if state.Type == "series" {
+				if len(state.SeriesStreams) == 0 {
+					state.Step = 7
+					sendEpPrompt(ctx, u)
+				} else {
+					sendLoteResponse(ctx, u, "Já existem arquivos adicionados. Para alterar o áudio, clique em **🔊 Alterar Áudio**.", getWaitingFilesMarkup(state))
+				}
+			} else {
+				if len(state.MovieStreams) == 0 {
+					state.Step = 5
+					state.EditingAudio = false
+					sendAudioPrompt(ctx, u, state.Title, state.ImdbID, false)
+				} else {
+					sendLoteResponse(ctx, u, "Já existem arquivos adicionados. Para alterar o áudio, clique em **🔊 Alterar Áudio**.", getWaitingFilesMarkup(state))
+				}
+			}
 		}
 	case strings.HasPrefix(data, "lote_sel_"):
 		if state.Step == 4 {
@@ -841,19 +1182,30 @@ func handleLoteCallbackQuery(ctx *ext.Context, u *ext.Update) error {
 				state.ImdbID = selected.ID
 				state.Title = selected.Name
 				state.Step = 5
-				sendAudioPrompt(ctx, u, state.Title, state.ImdbID)
+				sendAudioPrompt(ctx, u, state.Title, state.ImdbID, false)
 			}
 		}
 	case strings.HasPrefix(data, "lote_audio_"):
 		if state.Step == 5 {
 			audio := strings.TrimPrefix(data, "lote_audio_")
+			oldAudio := state.Audio
 			state.Audio = audio
+
+			if state.EditingAudio {
+				state.EditingAudio = false
+				state.Step = 8
+				applyAudioUpdate(state, oldAudio, state.Audio)
+				sendLoteResponse(ctx, u, fmt.Sprintf("🔊 Áudio alterado com sucesso para: **%s**!\n\nEnvie os arquivos de vídeo ou clique em **Concluir Lote**.", state.Audio), getWaitingFilesMarkup(state))
+				return nil
+			}
 
 			if state.Type == "series" {
 				state.Step = 6
 				sendSeasonPrompt(ctx, u)
 			} else {
-				state.MovieStreams = []StreamObj{}
+				if state.MovieStreams == nil {
+					state.MovieStreams = []StreamObj{}
+				}
 				state.Step = 8
 				msgStr := fmt.Sprintf("✅ **Configurações Concluídas!**\n\n- **Colaborador**: %s\n- **Tipo**: Filme\n- **Título**: %s (%s)\n- **Áudio**: %s\n\nAgora, **envie os arquivos de vídeo** para este lote.\n\nQuando terminar, envie `/concluido`.", state.Colaborador, state.Title, state.ImdbID, state.Audio)
 				sendLoteResponse(ctx, u, msgStr, getWaitingFilesMarkup(state))
@@ -921,12 +1273,36 @@ func sendTypePrompt(ctx *ext.Context, u *ext.Update) {
 					},
 				},
 			},
+			{
+				Buttons: []tg.KeyboardButtonClass{
+					&tg.KeyboardButtonCallback{
+						Text: "❌ Cancelar",
+						Data: []byte("lote_cancelar"),
+					},
+				},
+			},
 		},
 	}
 	sendLoteResponse(ctx, u, "Qual é o tipo de conteúdo?", markup)
 }
 
-func sendAudioPrompt(ctx *ext.Context, u *ext.Update, title, imdbID string) {
+func sendAudioPrompt(ctx *ext.Context, u *ext.Update, title, imdbID string, isEditing bool) {
+	var backRow tg.KeyboardButtonRow
+	if isEditing {
+		backRow = tg.KeyboardButtonRow{
+			Buttons: []tg.KeyboardButtonClass{
+				&tg.KeyboardButtonCallback{Text: "🔙 Voltar (Manter Atual)", Data: []byte("lote_cancel_audio_change")},
+			},
+		}
+	} else {
+		backRow = tg.KeyboardButtonRow{
+			Buttons: []tg.KeyboardButtonClass{
+				&tg.KeyboardButtonCallback{Text: "🔙 Voltar", Data: []byte("lote_back_from_audio")},
+				&tg.KeyboardButtonCallback{Text: "❌ Cancelar", Data: []byte("lote_cancelar")},
+			},
+		}
+	}
+
 	markup := &tg.ReplyInlineMarkup{
 		Rows: []tg.KeyboardButtonRow{
 			{
@@ -946,9 +1322,15 @@ func sendAudioPrompt(ctx *ext.Context, u *ext.Update, title, imdbID string) {
 					&tg.KeyboardButtonCallback{Text: "English", Data: []byte("lote_audio_English")},
 				},
 			},
+			backRow,
 		},
 	}
-	sendLoteResponse(ctx, u, fmt.Sprintf("Encontrado: %s (%s)\n\nEscolha o idioma/áudio nos botões abaixo:", title, imdbID), markup)
+
+	promptText := fmt.Sprintf("Encontrado: **%s** (`%s`)\n\nEscolha o idioma/áudio nos botões abaixo:", title, imdbID)
+	if isEditing {
+		promptText = fmt.Sprintf("Alterando áudio para: **%s** (`%s`)\n\nEscolha o novo idioma/áudio nos botões abaixo:", title, imdbID)
+	}
+	sendLoteResponse(ctx, u, promptText, markup)
 }
 
 func getStreamLinkForMessage(ctx *ext.Context, u *ext.Update, chatId int64) (string, string, error) {

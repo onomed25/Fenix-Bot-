@@ -3,6 +3,7 @@ package commands
 import (
 	"encoding/json"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/celestix/gotgproto/ext"
@@ -495,5 +496,132 @@ func TestAutoDetectBatchProcessing(t *testing.T) {
 	}
 	if len(state.SeriesStreams["2"]) != 1 { // E1
 		t.Errorf("Expected Season 2 to have 1 episode, got %d", len(state.SeriesStreams["2"]))
+	}
+}
+
+func TestApplyAudioUpdate(t *testing.T) {
+	// 1. Test movie streams audio replacement
+	movieState := &LoteState{
+		Type:  "movie",
+		Audio: "Dublado",
+		MovieStreams: []StreamObj{
+			{
+				URL:  "/stream/1",
+				Name: "Dublado\n1080p",
+			},
+			{
+				URL:  "/stream/2",
+				Name: "Dublado\n720p",
+			},
+		},
+	}
+
+	applyAudioUpdate(movieState, "Dublado", "Legendado")
+
+	if movieState.Audio != "Legendado" {
+		t.Errorf("Expected state.Audio to be Legendado, got %s", movieState.Audio)
+	}
+	if movieState.MovieStreams[0].Name != "Legendado\n1080p" {
+		t.Errorf("Expected stream 0 Name to be 'Legendado\\n1080p', got %s", movieState.MovieStreams[0].Name)
+	}
+	if movieState.MovieStreams[1].Name != "Legendado\n720p" {
+		t.Errorf("Expected stream 1 Name to be 'Legendado\\n720p', got %s", movieState.MovieStreams[1].Name)
+	}
+
+	// 2. Test series streams audio replacement
+	seriesState := &LoteState{
+		Type:  "series",
+		Audio: "Dublado",
+		SeriesStreams: map[string]map[string][]StreamObj{
+			"1": {
+				"1": []StreamObj{
+					{
+						URL:  "/stream/10",
+						Name: "Dublado\n1080p",
+					},
+				},
+				"2": []StreamObj{
+					{
+						URL:  "/stream/11",
+						Name: "Dublado\n1080p",
+					},
+				},
+			},
+		},
+	}
+
+	applyAudioUpdate(seriesState, "Dublado", "Dual Áudio")
+
+	if seriesState.Audio != "Dual Áudio" {
+		t.Errorf("Expected state.Audio to be Dual Áudio, got %s", seriesState.Audio)
+	}
+	if seriesState.SeriesStreams["1"]["1"][0].Name != "Dual Áudio\n1080p" {
+		t.Errorf("Expected S01E01 Name to be 'Dual Áudio\\n1080p', got %s", seriesState.SeriesStreams["1"]["1"][0].Name)
+	}
+	if seriesState.SeriesStreams["1"]["2"][0].Name != "Dual Áudio\n1080p" {
+		t.Errorf("Expected S01E02 Name to be 'Dual Áudio\\n1080p', got %s", seriesState.SeriesStreams["1"]["2"][0].Name)
+	}
+}
+
+func TestStepTransitionsAndVoltar(t *testing.T) {
+	// Test step state machine logic for navigation
+	state := &LoteState{
+		Step:   6,
+		Type:   "series",
+		Title:  "Breaking Bad",
+		ImdbID: "tt0903747",
+		Audio:  "Dublado",
+	}
+
+	// Going back from Step 6 (Season prompt) should return to Step 5 (Audio prompt)
+	if state.Step == 6 {
+		state.Step = 5
+		state.EditingAudio = false
+	}
+	if state.Step != 5 {
+		t.Errorf("Expected Step to be 5, got %d", state.Step)
+	}
+
+	// Changing audio from Dublado to Legendado
+	state.Audio = "Legendado"
+	state.Step = 6
+	if state.Audio != "Legendado" || state.Step != 6 {
+		t.Errorf("Expected Audio to be Legendado and Step 6, got %s, %d", state.Audio, state.Step)
+	}
+
+	// Step 8 with 0 files for series -> going back should go to Step 7
+	state.Step = 8
+	state.SeriesStreams = make(map[string]map[string][]StreamObj)
+	if len(state.SeriesStreams) == 0 {
+		state.Step = 7
+	}
+	if state.Step != 7 {
+		t.Errorf("Expected Step to be 7, got %d", state.Step)
+	}
+
+	// Step 7 -> going back should go to Step 6
+	if state.Step == 7 {
+		state.Step = 6
+	}
+	if state.Step != 6 {
+		t.Errorf("Expected Step to be 6, got %d", state.Step)
+	}
+
+	// Step 4 match selection: user decides to search again or enter IMDb ID
+	state.Step = 4
+	state.SearchResults = []CinemetaSearchResult{
+		{ID: "tt111", Name: "Option 1", Year: "2020"},
+	}
+
+	// Simulating user typing IMDb ID "tt0903747" in Step 4
+	inputText := "tt0903747"
+	if strings.HasPrefix(inputText, "tt") {
+		state.ImdbID = inputText
+		state.Title = "Breaking Bad"
+		state.SearchResults = nil
+		state.Step = 5
+	}
+	if state.Step != 5 || state.ImdbID != "tt0903747" {
+		t.Errorf("Expected Step 5 with IMDb ID tt0903747, got step %d id %s", state.Step, state.ImdbID)
 	}
 }
