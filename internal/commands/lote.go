@@ -8,6 +8,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,18 +39,214 @@ type CinemetaSearchResult struct {
 }
 
 type LoteState struct {
-	Step          int // 1: Nick, 2: Type, 3: Search, 4: MatchSelection, 5: Audio, 6: Season, 7: StartEp, 8: Files
-	Colaborador   string
-	Type          string // "movie" or "series"
-	ImdbID        string
-	Title         string
-	Audio         string
-	Season        int
-	CurrentEp     int
-	MovieStreams  []StreamObj
-	SeriesStreams map[string]map[string][]StreamObj // Season -> Ep -> []StreamObj
-	SearchResults []CinemetaSearchResult
-	Mutex         sync.Mutex // Per-user lock for processing files & messages
+	Step             int // 2: Type, 3: Search, 4: MatchSelection, 5: Audio, 6: Season, 7: StartEp, 8: Files
+	Colaborador      string
+	Type             string // "movie" or "series"
+	ImdbID           string
+	Title            string
+	Audio            string
+	Season           int
+	CurrentEp        int
+	AutoDetectSeason bool
+	AutoDetectEp     bool
+	MovieStreams     []StreamObj
+	SeriesStreams    map[string]map[string][]StreamObj // Season -> Ep -> []StreamObj
+	SearchResults    []CinemetaSearchResult
+	Mutex            sync.Mutex // Per-user lock for processing files & messages
+}
+
+var (
+	// Chapter / Daily markers: "CAPITULO [X]", "QUARTA FEIRA", etc.
+	chapterRegex = regexp.MustCompile(`(?i)(` +
+		`\bcap[ií]tulos?\b` +
+		`|\bcap\.?\s*\[?\s*\d+\s*\]?` +
+		`|\b(segunda|ter[cç]a|quarta|quinta|sexta)[\s\-_]*feiras?\b` +
+		`|\b(edi[cç][aã]o\s+de\s+)?(s[aá]bado|domingo)\s*[-–—/:]?\s*\d{1,2}` +
+		`|\b(novela|programa\s+di[aá]rio)\b` +
+		`)`)
+
+	chapterNumRegex        = regexp.MustCompile(`(?i)\bcap(?:[ií]tulo|\.)?\s*\[?\s*(\d+)\s*\]?`)
+	chapterNumOrdinalRegex = regexp.MustCompile(`(?i)\b(\d{1,4})\s*º?\s*cap[ií]tulo\b`)
+
+	// Series patterns
+	sePatternRegex        = regexp.MustCompile(`(?i)(?:^|[^a-zA-Z0-9])[ST](\d{1,2})[\.\-\_\s]*E(\d{1,3})(?:[^a-zA-Z0-9]|$)`)
+	xPatternRegex         = regexp.MustCompile(`(?i)(?:^|[^a-zA-Z0-9])(\d{1,2})x(\d{1,3})(?:[^a-zA-Z0-9]|$)`)
+	seasonOrdinalRegex    = regexp.MustCompile(`(?i)(?:^|[^a-zA-Z0-9])(\d{1,2})\s*(?:[ªºa]|ª|º)?[\s\.\-_]*temporada(?:[^a-zA-Z0-9]|$)`)
+	seasonWordRegex       = regexp.MustCompile(`(?i)\b(?:temporada|season|temp\.?)[\s\.\-_:]*S?(\d{1,2})\b`)
+	seasonStandaloneRegex = regexp.MustCompile(`(?i)(?:^|[^a-zA-Z0-9])[ST](\d{1,2})(?:[^a-zA-Z0-9]|$)`)
+	epWordRegex           = regexp.MustCompile(`(?i)\b(?:epis[oó]dio|episode|ep\.?)[\s\.\-_:]*E?(\d{1,3})\b`)
+	epStandaloneRegex     = regexp.MustCompile(`(?i)(?:^|[^a-zA-Z0-9])E(\d{1,3})(?:[^a-zA-Z0-9]|$)`)
+)
+
+func extractColaborador(u *ext.Update) string {
+	if u.EffectiveMessage != nil {
+		text := strings.TrimSpace(u.EffectiveMessage.Text)
+		if strings.HasPrefix(text, "/lote") {
+			arg := strings.TrimSpace(strings.TrimPrefix(text, "/lote"))
+			if arg != "" {
+				return arg
+			}
+		}
+	}
+	if user := u.EffectiveUser(); user != nil {
+		if user.Username != "" {
+			return user.Username
+		}
+		fullName := strings.TrimSpace(user.FirstName + " " + user.LastName)
+		if fullName != "" {
+			return fullName
+		}
+		if user.FirstName != "" {
+			return user.FirstName
+		}
+		if user.ID != 0 {
+			return strconv.FormatInt(user.ID, 10)
+		}
+	}
+	return "Colaborador"
+}
+
+func isChapterContent(text string) bool {
+	return chapterRegex.MatchString(text)
+}
+
+func extractChapterNumber(text string) int {
+	if m := chapterNumRegex.FindStringSubmatch(text); len(m) > 1 {
+		if val, err := strconv.Atoi(m[1]); err == nil && val > 0 {
+			return val
+		}
+	}
+	if m := chapterNumOrdinalRegex.FindStringSubmatch(text); len(m) > 1 {
+		if val, err := strconv.Atoi(m[1]); err == nil && val > 0 {
+			return val
+		}
+	}
+	return 0
+}
+
+func DetectSeasonAndEpisode(fileName, caption string) (season int, episode int, isChapter bool) {
+	combined := fileName + "\n" + caption
+	if isChapterContent(combined) {
+		isChapter = true
+		season = 1 // Forced to Season 1 for chapter releases, ignoring any multiple seasons
+		episode = extractChapterNumber(combined)
+		return season, episode, isChapter
+	}
+
+	// 1. Try SxxExx or TxxExx in fileName then caption
+	if m := sePatternRegex.FindStringSubmatch(fileName); len(m) > 2 {
+		s, _ := strconv.Atoi(m[1])
+		e, _ := strconv.Atoi(m[2])
+		return s, e, false
+	}
+	if m := sePatternRegex.FindStringSubmatch(caption); len(m) > 2 {
+		s, _ := strconv.Atoi(m[1])
+		e, _ := strconv.Atoi(m[2])
+		return s, e, false
+	}
+
+	// 2. Try (\d+)x(\d+) in fileName then caption
+	if m := xPatternRegex.FindStringSubmatch(fileName); len(m) > 2 {
+		s, _ := strconv.Atoi(m[1])
+		e, _ := strconv.Atoi(m[2])
+		if !(s == 16 && e == 9) && !(s == 4 && e == 3) {
+			return s, e, false
+		}
+	}
+	if m := xPatternRegex.FindStringSubmatch(caption); len(m) > 2 {
+		s, _ := strconv.Atoi(m[1])
+		e, _ := strconv.Atoi(m[2])
+		if !(s == 16 && e == 9) && !(s == 4 && e == 3) {
+			return s, e, false
+		}
+	}
+
+	// 3. Try Season words in fileName then caption
+	searchSeason := func(t string) int {
+		if m := seasonOrdinalRegex.FindStringSubmatch(t); len(m) > 1 {
+			if s, err := strconv.Atoi(m[1]); err == nil && s > 0 {
+				return s
+			}
+		}
+		if m := seasonWordRegex.FindStringSubmatch(t); len(m) > 1 {
+			if s, err := strconv.Atoi(m[1]); err == nil && s > 0 {
+				return s
+			}
+		}
+		if m := seasonStandaloneRegex.FindStringSubmatch(t); len(m) > 1 {
+			if s, err := strconv.Atoi(m[1]); err == nil && s > 0 {
+				return s
+			}
+		}
+		return 0
+	}
+
+	if s := searchSeason(fileName); s > 0 {
+		season = s
+	} else if s := searchSeason(caption); s > 0 {
+		season = s
+	}
+
+	// 4. Try Episode words in fileName then caption
+	searchEp := func(t string) int {
+		if m := epWordRegex.FindStringSubmatch(t); len(m) > 1 {
+			if e, err := strconv.Atoi(m[1]); err == nil && e > 0 {
+				return e
+			}
+		}
+		if m := epStandaloneRegex.FindStringSubmatch(t); len(m) > 1 {
+			if e, err := strconv.Atoi(m[1]); err == nil && e > 0 {
+				return e
+			}
+		}
+		return 0
+	}
+
+	if e := searchEp(fileName); e > 0 {
+		episode = e
+	} else if e := searchEp(caption); e > 0 {
+		episode = e
+	}
+
+	return season, episode, false
+}
+
+func getSkipSeasonMarkup() *tg.ReplyInlineMarkup {
+	return &tg.ReplyInlineMarkup{
+		Rows: []tg.KeyboardButtonRow{
+			{
+				Buttons: []tg.KeyboardButtonClass{
+					&tg.KeyboardButtonCallback{
+						Text: "⏩ Deixar em branco (Auto-detectar)",
+						Data: []byte("lote_skip_season"),
+					},
+				},
+			},
+		},
+	}
+}
+
+func sendSeasonPrompt(ctx *ext.Context, u *ext.Update) {
+	sendLoteResponse(ctx, u, "Qual é a temporada do lote? (Ex: 1 ou deixe em branco para detecção automática):", getSkipSeasonMarkup())
+}
+
+func getSkipEpMarkup() *tg.ReplyInlineMarkup {
+	return &tg.ReplyInlineMarkup{
+		Rows: []tg.KeyboardButtonRow{
+			{
+				Buttons: []tg.KeyboardButtonClass{
+					&tg.KeyboardButtonCallback{
+						Text: "⏩ Deixar em branco (Auto-detectar)",
+						Data: []byte("lote_skip_ep"),
+					},
+				},
+			},
+		},
+	}
+}
+
+func sendEpPrompt(ctx *ext.Context, u *ext.Update) {
+	sendLoteResponse(ctx, u, "Qual é o número do episódio inicial? (Ex: 1 ou deixe em branco para detecção automática):", getSkipEpMarkup())
 }
 
 var (
@@ -200,15 +397,27 @@ func HandleLoteMessage(ctx *ext.Context, u *ext.Update) (bool, error) {
 		return false, nil
 	}
 
-	switch state.Step {
-	case 1: // Nick
-		if strings.ToLower(text) == "pular" {
-			if user := u.EffectiveUser(); user != nil {
-				state.Colaborador = user.FirstName
-			} else {
-				state.Colaborador = "Colaborador"
+	if state.Step == 6 || state.Step == 7 {
+		supported, err := supportedMediaFilter(u.EffectiveMessage)
+		if err == nil && supported {
+			if state.Step == 6 {
+				state.AutoDetectSeason = true
+				state.Season = 1
 			}
-		} else {
+			state.AutoDetectEp = true
+			if state.CurrentEp < 1 {
+				state.CurrentEp = 1
+			}
+			if state.SeriesStreams == nil {
+				state.SeriesStreams = make(map[string]map[string][]StreamObj)
+			}
+			state.Step = 8
+		}
+	}
+
+	switch state.Step {
+	case 1: // Legacy Nick fallback
+		if text != "" {
 			state.Colaborador = text
 		}
 		state.Step = 2
@@ -297,7 +506,7 @@ func HandleLoteMessage(ctx *ext.Context, u *ext.Update) (bool, error) {
 
 		if state.Type == "series" {
 			state.Step = 6
-			sendLoteResponse(ctx, u, "Qual é a temporada do lote? (Ex: 1)", nil)
+			sendSeasonPrompt(ctx, u)
 		} else {
 			state.MovieStreams = []StreamObj{}
 			state.Step = 8
@@ -307,26 +516,54 @@ func HandleLoteMessage(ctx *ext.Context, u *ext.Update) (bool, error) {
 		return true, nil
 
 	case 6: // Season
+		lower := strings.ToLower(text)
+		if text == "" || lower == "pular" || lower == "skip" || lower == "auto" || lower == "deixar em branco" || lower == "em branco" || text == "-" || text == "0" {
+			state.AutoDetectSeason = true
+			state.Season = 1
+			state.Step = 7
+			sendEpPrompt(ctx, u)
+			return true, nil
+		}
 		season, err := strconv.Atoi(text)
 		if err != nil || season < 1 {
-			sendLoteResponse(ctx, u, "Temporada inválida. Digite um número positivo:", nil)
+			sendLoteResponse(ctx, u, "Temporada inválida. Digite um número positivo (ou clique abaixo para detectar automaticamente):", getSkipSeasonMarkup())
 			return true, nil
 		}
 		state.Season = season
+		state.AutoDetectSeason = false
 		state.Step = 7
-		sendLoteResponse(ctx, u, "Qual é o número do episódio inicial? (Ex: 1)", nil)
+		sendEpPrompt(ctx, u)
 		return true, nil
 
 	case 7: // Start ep
+		lower := strings.ToLower(text)
+		if text == "" || lower == "pular" || lower == "skip" || lower == "auto" || lower == "deixar em branco" || lower == "em branco" || text == "-" || text == "0" {
+			state.AutoDetectEp = true
+			state.CurrentEp = 1
+			state.SeriesStreams = make(map[string]map[string][]StreamObj)
+			state.Step = 8
+			seasonDesc := fmt.Sprintf("%d", state.Season)
+			if state.AutoDetectSeason {
+				seasonDesc = "Automática (pelo arquivo/legenda)"
+			}
+			msgStr := fmt.Sprintf("✅ **Configurações Concluídas!**\n\n- **Colaborador**: %s\n- **Tipo**: Série\n- **Título**: %s (%s)\n- **Áudio**: %s\n- **Temporada**: %s\n- **Episódio Inicial**: Automático\n\nAgora, **envie os arquivos de vídeo**.\nQuando terminar, envie `/concluido`.", state.Colaborador, state.Title, state.ImdbID, state.Audio, seasonDesc)
+			sendLoteResponse(ctx, u, msgStr, getWaitingFilesMarkup(state))
+			return true, nil
+		}
 		ep, err := strconv.Atoi(text)
 		if err != nil || ep < 1 {
-			sendLoteResponse(ctx, u, "Episódio inválido. Digite um número positivo:", nil)
+			sendLoteResponse(ctx, u, "Episódio inválido. Digite um número positivo (ou clique abaixo para detectar automaticamente):", getSkipEpMarkup())
 			return true, nil
 		}
 		state.CurrentEp = ep
+		state.AutoDetectEp = false
 		state.SeriesStreams = make(map[string]map[string][]StreamObj)
 		state.Step = 8
-		msgStr := fmt.Sprintf("✅ **Configurações Concluídas!**\n\n- **Colaborador**: %s\n- **Tipo**: Série\n- **Título**: %s (%s)\n- **Áudio**: %s\n- **Temporada**: %d\n- **Episódio Inicial**: %d\n\nAgora, **envie os arquivos de vídeo em ordem**.\nO número do episódio será incrementado a cada envio.\n\nQuando terminar, envie `/concluido`.", state.Colaborador, state.Title, state.ImdbID, state.Audio, state.Season, state.CurrentEp)
+		seasonDesc := fmt.Sprintf("%d", state.Season)
+		if state.AutoDetectSeason {
+			seasonDesc = "Automática (pelo arquivo/legenda)"
+		}
+		msgStr := fmt.Sprintf("✅ **Configurações Concluídas!**\n\n- **Colaborador**: %s\n- **Tipo**: Série\n- **Título**: %s (%s)\n- **Áudio**: %s\n- **Temporada**: %s\n- **Episódio Inicial**: %d\n\nAgora, **envie os arquivos de vídeo em ordem**.\nQuando terminar, envie `/concluido`.", state.Colaborador, state.Title, state.ImdbID, state.Audio, seasonDesc, state.CurrentEp)
 		sendLoteResponse(ctx, u, msgStr, getWaitingFilesMarkup(state))
 		return true, nil
 
@@ -355,17 +592,53 @@ func HandleLoteMessage(ctx *ext.Context, u *ext.Update) (bool, error) {
 			state.MovieStreams = append(state.MovieStreams, streamObj)
 			sendLoteResponse(ctx, u, fmt.Sprintf("🎬 Link de filme adicionado!\n- **Nome**: %s\n- **Qualidade**: %s\n- **URL**: %s\n\nEnvie outro arquivo ou clique em **Concluir Lote**.", fileName, quality, link), getWaitingFilesMarkup(state))
 		} else {
-			seasonStr := strconv.Itoa(state.Season)
-			epStr := strconv.Itoa(state.CurrentEp)
+			season := state.Season
+			ep := state.CurrentEp
 
+			caption := ""
+			if u.EffectiveMessage != nil {
+				caption = u.EffectiveMessage.Text
+			}
+
+			if state.AutoDetectSeason || state.AutoDetectEp {
+				detSeason, detEp, isChapter := DetectSeasonAndEpisode(fileName, caption)
+				if isChapter {
+					// Chapter exception: Force season 1, ignore multiple seasons
+					season = 1
+					if detEp > 0 {
+						ep = detEp
+					}
+				} else {
+					if state.AutoDetectSeason && detSeason > 0 {
+						season = detSeason
+					}
+					if detEp > 0 {
+						ep = detEp
+					}
+				}
+			}
+
+			if season < 1 {
+				season = 1
+			}
+			if ep < 1 {
+				ep = 1
+			}
+
+			seasonStr := strconv.Itoa(season)
+			epStr := strconv.Itoa(ep)
+
+			if state.SeriesStreams == nil {
+				state.SeriesStreams = make(map[string]map[string][]StreamObj)
+			}
 			if state.SeriesStreams[seasonStr] == nil {
 				state.SeriesStreams[seasonStr] = make(map[string][]StreamObj)
 			}
 			state.SeriesStreams[seasonStr][epStr] = append(state.SeriesStreams[seasonStr][epStr], streamObj)
 
-			oldEp := state.CurrentEp
-			state.CurrentEp++
-			sendLoteResponse(ctx, u, fmt.Sprintf("📺 Episódio %d adicionado!\n- **Nome**: %s\n- **Qualidade**: %s\n- **URL**: %s\n\nPróximo esperado: %d.\nEnvie outro arquivo ou clique em **Concluir Lote**.", oldEp, fileName, quality, link, state.CurrentEp), getWaitingFilesMarkup(state))
+			state.Season = season
+			state.CurrentEp = ep + 1
+			sendLoteResponse(ctx, u, fmt.Sprintf("📺 **S%02dE%02d** adicionado!\n- **Temporada**: %d\n- **Episódio**: %d\n- **Nome**: %s\n- **Qualidade**: %s\n- **URL**: %s\n\nPróximo esperado: S%02dE%02d.\nEnvie outro arquivo ou clique em **Concluir Lote**.", season, ep, season, ep, fileName, quality, link, state.Season, state.CurrentEp), getWaitingFilesMarkup(state))
 		}
 		return true, nil
 	}
@@ -385,25 +658,16 @@ func startLote(ctx *ext.Context, u *ext.Update) error {
 		return dispatcher.EndGroups
 	}
 
+	colab := extractColaborador(u)
+
 	loteMutex.Lock()
 	loteStates[chatId] = &LoteState{
-		Step: 1,
+		Step:        2,
+		Colaborador: colab,
 	}
 	loteMutex.Unlock()
 
-	markup := &tg.ReplyInlineMarkup{
-		Rows: []tg.KeyboardButtonRow{
-			{
-				Buttons: []tg.KeyboardButtonClass{
-					&tg.KeyboardButtonCallback{
-						Text: "Pular (Usar nome do Telegram)",
-						Data: []byte("lote_skip_nick"),
-					},
-				},
-			},
-		},
-	}
-	sendLoteResponse(ctx, u, "📦 **Lote Iniciado!**\n\nPor favor, digite seu **nick de colaborador**:", markup)
+	sendTypePrompt(ctx, u)
 	return dispatcher.EndGroups
 }
 
@@ -587,13 +851,33 @@ func handleLoteCallbackQuery(ctx *ext.Context, u *ext.Update) error {
 
 			if state.Type == "series" {
 				state.Step = 6
-				sendLoteResponse(ctx, u, "Qual é a temporada do lote? (Ex: 1)", nil)
+				sendSeasonPrompt(ctx, u)
 			} else {
 				state.MovieStreams = []StreamObj{}
 				state.Step = 8
 				msgStr := fmt.Sprintf("✅ **Configurações Concluídas!**\n\n- **Colaborador**: %s\n- **Tipo**: Filme\n- **Título**: %s (%s)\n- **Áudio**: %s\n\nAgora, **envie os arquivos de vídeo** para este lote.\n\nQuando terminar, envie `/concluido`.", state.Colaborador, state.Title, state.ImdbID, state.Audio)
 				sendLoteResponse(ctx, u, msgStr, getWaitingFilesMarkup(state))
 			}
+		}
+	case data == "lote_skip_season":
+		if state.Step == 6 {
+			state.AutoDetectSeason = true
+			state.Season = 1
+			state.Step = 7
+			sendEpPrompt(ctx, u)
+		}
+	case data == "lote_skip_ep":
+		if state.Step == 7 {
+			state.AutoDetectEp = true
+			state.CurrentEp = 1
+			state.SeriesStreams = make(map[string]map[string][]StreamObj)
+			state.Step = 8
+			seasonDesc := fmt.Sprintf("%d", state.Season)
+			if state.AutoDetectSeason {
+				seasonDesc = "Automática (pelo arquivo/legenda)"
+			}
+			msgStr := fmt.Sprintf("✅ **Configurações Concluídas!**\n\n- **Colaborador**: %s\n- **Tipo**: Série\n- **Título**: %s (%s)\n- **Áudio**: %s\n- **Temporada**: %s\n- **Episódio Inicial**: Automático\n\nAgora, **envie os arquivos de vídeo**.\nQuando terminar, envie `/concluido`.", state.Colaborador, state.Title, state.ImdbID, state.Audio, seasonDesc)
+			sendLoteResponse(ctx, u, msgStr, getWaitingFilesMarkup(state))
 		}
 	case data == "lote_concluir":
 		concluirLoteHelper(ctx, u, chatId)

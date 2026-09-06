@@ -2,8 +2,11 @@ package commands
 
 import (
 	"encoding/json"
+	"strconv"
 	"testing"
 
+	"github.com/celestix/gotgproto/ext"
+	"github.com/celestix/gotgproto/types"
 	"github.com/gotd/td/tg"
 )
 
@@ -179,5 +182,318 @@ func TestLoteStateSeasonChange(t *testing.T) {
 	}
 	if state.CurrentEp != 1 {
 		t.Errorf("Expected current episode to reset to 1, got %d", state.CurrentEp)
+	}
+}
+
+func TestDetectSeasonAndEpisode(t *testing.T) {
+	tests := []struct {
+		name        string
+		fileName    string
+		caption     string
+		wantSeason  int
+		wantEpisode int
+		wantChapter bool
+	}{
+		// Standard Series Patterns
+		{
+			name:        "S02E06 standard",
+			fileName:    "House.of.the.Dragon.S02E06.1080p.mkv",
+			caption:     "",
+			wantSeason:  2,
+			wantEpisode: 6,
+			wantChapter: false,
+		},
+		{
+			name:        "s01e01 lowercase",
+			fileName:    "serie.s01e01.mp4",
+			caption:     "",
+			wantSeason:  1,
+			wantEpisode: 1,
+			wantChapter: false,
+		},
+		{
+			name:        "S2E6 single digit",
+			fileName:    "Show.S2E6.mkv",
+			caption:     "",
+			wantSeason:  2,
+			wantEpisode: 6,
+			wantChapter: false,
+		},
+		{
+			name:        "S01-E05 dash format",
+			fileName:    "Anime.S01-E05.mkv",
+			caption:     "",
+			wantSeason:  1,
+			wantEpisode: 5,
+			wantChapter: false,
+		},
+		{
+			name:        "S01_E05 underscore format",
+			fileName:    "Anime_S01_E05_1080p.mkv",
+			caption:     "",
+			wantSeason:  1,
+			wantEpisode: 5,
+			wantChapter: false,
+		},
+		{
+			name:        "T01E05 Portuguese/Spanish notation",
+			fileName:    "Serie.T01E05.mkv",
+			caption:     "",
+			wantSeason:  1,
+			wantEpisode: 5,
+			wantChapter: false,
+		},
+		{
+			name:        "2x06 notation",
+			fileName:    "The.Flash.2x06.1080p.mkv",
+			caption:     "",
+			wantSeason:  2,
+			wantEpisode: 6,
+			wantChapter: false,
+		},
+		{
+			name:        "2ª Temporada in filename",
+			fileName:    "Dark.2ª.Temporada.mkv",
+			caption:     "",
+			wantSeason:  2,
+			wantEpisode: 0,
+			wantChapter: false,
+		},
+		{
+			name:        "Standalone S03 in filename",
+			fileName:    "Stranger.Things.S03.1080p.mkv",
+			caption:     "",
+			wantSeason:  3,
+			wantEpisode: 0,
+			wantChapter: false,
+		},
+		{
+			name:     "Long caption with multiple metadata blocks and emojis",
+			fileName: "video_8932.mkv",
+			caption: `╔═════════════════════════╗
+║       FENIX FILMES & SÉRIES      ║
+╚═════════════════════════╝
+
+🍿 Título: Shogun
+📅 Ano: 2024
+🎭 Gênero: Drama, Histórico
+⭐ IMDb: 8.8/10
+
+ℹ️ SINOPSE:
+No Japão do século XVII, Lord Yoshii Toranaga luta por sua vida...
+
+📁 DADOS DO ARQUIVO:
+📺 Formato: MKV
+🔊 Áudio: Dual Áudio (PT-BR / EN)
+📜 Legenda: PT-BR
+📊 Qualidade: WEB-DL 1080p
+⏱️ Duração: 58 Min
+
+📌 INFORMAÇÕES DO EPISÓDIO:
+🔹 Temporada: S02
+🔹 Episódio: E06
+
+⬇️ BAIXAR ABAIXO:`,
+			wantSeason:  2,
+			wantEpisode: 6,
+			wantChapter: false,
+		},
+		{
+			name:        "Caption with Temporada 3 and Episódio 8",
+			fileName:    "file.mkv",
+			caption:     "Série Incrível\nTemporada: 3\nEpisódio: 8\nDual Áudio",
+			wantSeason:  3,
+			wantEpisode: 8,
+			wantChapter: false,
+		},
+
+		// Chapter / Novela / Daily program Exceptions
+		{
+			name:        "CAPITULO [X] brackets",
+			fileName:    "Novela.Renascer.Capitulo.45.mkv",
+			caption:     "🌸 RENASCER 🌸\nCAPITULO [45]\nQUARTA FEIRA - 13/03/2024\nQualidade: 1080p",
+			wantSeason:  1,
+			wantEpisode: 45,
+			wantChapter: true,
+		},
+		{
+			name:        "CAPITULO with S02 in metadata - forces Season 1",
+			fileName:    "Novela.Mania.de.Voce.S02E15.mkv",
+			caption:     "MANIA DE VOCÊ - CAPITULO 15 - QUARTA FEIRA - Temporada 2",
+			wantSeason:  1,
+			wantEpisode: 15,
+			wantChapter: true,
+		},
+		{
+			name:        "QUARTA-FEIRA daily show exception",
+			fileName:    "Jornal.Hoje.15.05.2024.mp4",
+			caption:     "📰 JORNAL HOJE\nQUARTA FEIRA - 15/05/2024\nEdição Completa",
+			wantSeason:  1,
+			wantEpisode: 0,
+			wantChapter: true,
+		},
+		{
+			name:        "Cap. 120 in filename",
+			fileName:    "Pantanal.Cap.120.1080p.mkv",
+			caption:     "",
+			wantSeason:  1,
+			wantEpisode: 120,
+			wantChapter: true,
+		},
+		{
+			name:        "TERÇA-FEIRA in caption",
+			fileName:    "Novela.mkv",
+			caption:     "Capítulo 89 - TERÇA-FEIRA",
+			wantSeason:  1,
+			wantEpisode: 89,
+			wantChapter: true,
+		},
+		{
+			name:        "SEGUNDA-FEIRA in caption",
+			fileName:    "Novela.mkv",
+			caption:     "CAPITULO [01] - SEGUNDA FEIRA",
+			wantSeason:  1,
+			wantEpisode: 1,
+			wantChapter: true,
+		},
+		{
+			name:        "SEXTA-FEIRA in caption",
+			fileName:    "Globo.Reporter.Sexta-Feira.mkv",
+			caption:     "GLOBO REPÓRTER - SEXTA-FEIRA",
+			wantSeason:  1,
+			wantEpisode: 0,
+			wantChapter: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotSeason, gotEp, gotChapter := DetectSeasonAndEpisode(tt.fileName, tt.caption)
+			if gotChapter != tt.wantChapter {
+				t.Errorf("DetectSeasonAndEpisode() gotChapter = %v, want %v", gotChapter, tt.wantChapter)
+			}
+			if gotSeason != tt.wantSeason {
+				t.Errorf("DetectSeasonAndEpisode() gotSeason = %v, want %v", gotSeason, tt.wantSeason)
+			}
+			if gotEp != tt.wantEpisode {
+				t.Errorf("DetectSeasonAndEpisode() gotEpisode = %v, want %v", gotEp, tt.wantEpisode)
+			}
+		})
+	}
+}
+
+func TestExtractColaborador(t *testing.T) {
+	// 1. With command argument "/lote ColabNick"
+	u1 := &ext.Update{
+		EffectiveMessage: &types.Message{
+			Text: "/lote ColabNick",
+		},
+	}
+	if got := extractColaborador(u1); got != "ColabNick" {
+		t.Errorf("extractColaborador() = %v, want ColabNick", got)
+	}
+
+	// 2. Default fallback when no user or args
+	u2 := &ext.Update{
+		EffectiveMessage: &types.Message{
+			Text: "/lote",
+		},
+	}
+	if got := extractColaborador(u2); got != "Colaborador" {
+		t.Errorf("extractColaborador() = %v, want Colaborador", got)
+	}
+}
+
+func TestAutoDetectBatchProcessing(t *testing.T) {
+	state := &LoteState{
+		Type:             "series",
+		AutoDetectSeason: true,
+		AutoDetectEp:     true,
+		Season:           1,
+		CurrentEp:        1,
+		SeriesStreams:    make(map[string]map[string][]StreamObj),
+	}
+
+	files := []struct {
+		fileName   string
+		caption    string
+		wantSeason string
+		wantEp     string
+	}{
+		{
+			fileName:   "Show.S01E01.mkv",
+			caption:    "",
+			wantSeason: "1",
+			wantEp:     "1",
+		},
+		{
+			fileName:   "Show.S01E02.mkv",
+			caption:    "",
+			wantSeason: "1",
+			wantEp:     "2",
+		},
+		{
+			fileName:   "Show.S02E01.mkv",
+			caption:    "",
+			wantSeason: "2",
+			wantEp:     "1",
+		},
+		{
+			fileName:   "Novela.S02.Capitulo.75.mkv",
+			caption:    "CAPITULO [75] - QUARTA FEIRA",
+			wantSeason: "1", // Forced to 1!
+			wantEp:     "75",
+		},
+	}
+
+	for _, f := range files {
+		season := state.Season
+		ep := state.CurrentEp
+
+		if state.AutoDetectSeason || state.AutoDetectEp {
+			detSeason, detEp, isChapter := DetectSeasonAndEpisode(f.fileName, f.caption)
+			if isChapter {
+				season = 1
+				if detEp > 0 {
+					ep = detEp
+				}
+			} else {
+				if state.AutoDetectSeason && detSeason > 0 {
+					season = detSeason
+				}
+				if detEp > 0 {
+					ep = detEp
+				}
+			}
+		}
+
+		seasonStr := strconv.Itoa(season)
+		epStr := strconv.Itoa(ep)
+
+		if state.SeriesStreams[seasonStr] == nil {
+			state.SeriesStreams[seasonStr] = make(map[string][]StreamObj)
+		}
+		state.SeriesStreams[seasonStr][epStr] = append(state.SeriesStreams[seasonStr][epStr], StreamObj{
+			URL:  "/stream/1",
+			Name: "Dublado 1080p",
+		})
+
+		state.Season = season
+		state.CurrentEp = ep + 1
+
+		if seasonStr != f.wantSeason {
+			t.Errorf("File %s: got season %s, want %s", f.fileName, seasonStr, f.wantSeason)
+		}
+		if epStr != f.wantEp {
+			t.Errorf("File %s: got ep %s, want %s", f.fileName, epStr, f.wantEp)
+		}
+	}
+
+	// Verify the final series streams map has entries for S1 and S2
+	if len(state.SeriesStreams["1"]) != 3 { // E1, E2, E75
+		t.Errorf("Expected Season 1 to have 3 episodes, got %d", len(state.SeriesStreams["1"]))
+	}
+	if len(state.SeriesStreams["2"]) != 1 { // E1
+		t.Errorf("Expected Season 2 to have 1 episode, got %d", len(state.SeriesStreams["2"]))
 	}
 }
