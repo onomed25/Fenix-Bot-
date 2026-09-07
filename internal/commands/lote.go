@@ -70,13 +70,13 @@ var (
 	chapterNumOrdinalRegex = regexp.MustCompile(`(?i)\b(\d{1,4})\s*º?\s*cap[ií]tulo\b`)
 
 	// Series patterns
-	sePatternRegex        = regexp.MustCompile(`(?i)(?:^|[^a-zA-Z0-9])[ST](\d{1,2})[\.\-\_\s]*E(\d{1,3})(?:[^a-zA-Z0-9]|$)`)
+	sePatternRegex        = regexp.MustCompile(`(?i)(?:^|[^a-zA-Z0-9])[ST](\d{1,2})[\.\-\_\s]*(?:E|EP)[\.\-\_\s]*(\d{1,3})(?:[^a-zA-Z0-9]|$)`)
 	xPatternRegex         = regexp.MustCompile(`(?i)(?:^|[^a-zA-Z0-9])(\d{1,2})x(\d{1,3})(?:[^a-zA-Z0-9]|$)`)
 	seasonOrdinalRegex    = regexp.MustCompile(`(?i)(?:^|[^a-zA-Z0-9])(\d{1,2})\s*(?:[ªºa]|ª|º)?[\s\.\-_]*temporada(?:[^a-zA-Z0-9]|$)`)
-	seasonWordRegex       = regexp.MustCompile(`(?i)\b(?:temporada|season|temp\.?)[\s\.\-_:]*S?(\d{1,2})\b`)
+	seasonWordRegex       = regexp.MustCompile(`(?i)(?:^|[^a-zA-Z0-9])(?:temporada|season|temp\.?)[\s\.\-_:]*S?(\d{1,2})(?:[^a-zA-Z0-9]|$)`)
 	seasonStandaloneRegex = regexp.MustCompile(`(?i)(?:^|[^a-zA-Z0-9])[ST](\d{1,2})(?:[^a-zA-Z0-9]|$)`)
-	epWordRegex           = regexp.MustCompile(`(?i)\b(?:epis[oó]dio|episode|ep\.?)[\s\.\-_:]*E?(\d{1,3})\b`)
-	epStandaloneRegex     = regexp.MustCompile(`(?i)(?:^|[^a-zA-Z0-9])E(\d{1,3})(?:[^a-zA-Z0-9]|$)`)
+	epWordRegex           = regexp.MustCompile(`(?i)(?:^|[^a-zA-Z0-9])(?:epis[oó]dio|episode|ep\.?)[\s\.\-_:]*E?(\d{1,3})(?:[^a-zA-Z0-9]|$)`)
+	epStandaloneRegex     = regexp.MustCompile(`(?i)(?:^|[^a-zA-Z0-9])(?:E|EP)[\.\-\_\s]*(\d{1,3})(?:[^a-zA-Z0-9]|$)`)
 )
 
 func extractColaborador(u *ext.Update) string {

@@ -307,6 +307,38 @@ No Japão do século XVII, Lord Yoshii Toranaga luta por sua vida...
 			wantEpisode: 8,
 			wantChapter: false,
 		},
+		{
+			name:        "T2_EP_10 with underscores",
+			fileName:    "010_serie_alfinetadas_eve_T2_EP_10_",
+			caption:     "",
+			wantSeason:  2,
+			wantEpisode: 10,
+			wantChapter: false,
+		},
+		{
+			name:        "T2_EP_7 with underscores",
+			fileName:    "07_serie_alfinetadas_eve_T2_EP_7_",
+			caption:     "",
+			wantSeason:  2,
+			wantEpisode: 7,
+			wantChapter: false,
+		},
+		{
+			name:        "Lupin T2 EP05 Dual",
+			fileName:    "Lupin_T2_EP05_Dual.mkv",
+			caption:     "",
+			wantSeason:  2,
+			wantEpisode: 5,
+			wantChapter: false,
+		},
+		{
+			name:        "Dark with underscores and words",
+			fileName:    "Dark_Temporada_2_Episodio_4.mp4",
+			caption:     "",
+			wantSeason:  2,
+			wantEpisode: 4,
+			wantChapter: false,
+		},
 
 		// Chapter / Novela / Daily program Exceptions
 		{
