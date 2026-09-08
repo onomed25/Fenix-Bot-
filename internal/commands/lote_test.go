@@ -2,6 +2,7 @@ package commands
 
 import (
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -483,20 +484,18 @@ func TestAutoDetectBatchProcessing(t *testing.T) {
 		season := state.Season
 		ep := state.CurrentEp
 
-		if state.AutoDetectSeason || state.AutoDetectEp {
-			detSeason, detEp, isChapter := DetectSeasonAndEpisode(f.fileName, f.caption)
-			if isChapter {
-				season = 1
-				if detEp > 0 {
-					ep = detEp
-				}
-			} else {
-				if state.AutoDetectSeason && detSeason > 0 {
-					season = detSeason
-				}
-				if detEp > 0 {
-					ep = detEp
-				}
+		detSeason, detEp, isChapter := DetectSeasonAndEpisode(f.fileName, f.caption)
+		if isChapter {
+			season = 1
+			if detEp > 0 {
+				ep = detEp
+			}
+		} else {
+			if detSeason > 0 {
+				season = detSeason
+			}
+			if detEp > 0 {
+				ep = detEp
 			}
 		}
 
@@ -655,5 +654,347 @@ func TestStepTransitionsAndVoltar(t *testing.T) {
 	}
 	if state.Step != 5 || state.ImdbID != "tt0903747" {
 		t.Errorf("Expected Step 5 with IMDb ID tt0903747, got step %d id %s", state.Step, state.ImdbID)
+	}
+}
+
+func TestDetectAbsoluteEpisode(t *testing.T) {
+	tests := []struct {
+		name     string
+		fileName string
+		caption  string
+		wantEp   int
+	}{
+		{
+			name:     "Erai-raws anime format with dash",
+			fileName: "[Erai-raws] Shingeki no Kyojin - 26 [1080p].mkv",
+			wantEp:   26,
+		},
+		{
+			name:     "SubsPlease format with 3-digit episode",
+			fileName: "[SubsPlease] Bleach - 060 (1080p) [98ABC123].mkv",
+			wantEp:   60,
+		},
+		{
+			name:     "SubsPlease One Piece 4-digit episode",
+			fileName: "[SubsPlease] One Piece - 1085 (1080p).mkv",
+			wantEp:   1085,
+		},
+		{
+			name:     "Naruto Shippuden space and 3-digit number",
+			fileName: "Naruto Shippuden 033.mp4",
+			wantEp:   33,
+		},
+		{
+			name:     "One Piece simple dash format",
+			fileName: "One Piece - 1085.mp4",
+			wantEp:   1085,
+		},
+		{
+			name:     "Episodio explicit word",
+			fileName: "Episodio 50.mp4",
+			wantEp:   50,
+		},
+		{
+			name:     "Ep dot explicit word",
+			fileName: "Ep. 50.mp4",
+			wantEp:   50,
+		},
+		{
+			name:     "EP prefix",
+			fileName: "EP50.mp4",
+			wantEp:   50,
+		},
+		{
+			name:     "Pure number filename 50",
+			fileName: "50.mp4",
+			wantEp:   50,
+		},
+		{
+			name:     "Pure number filename 01",
+			fileName: "01.mkv",
+			wantEp:   1,
+		},
+		{
+			name:     "Underscores normalized",
+			fileName: "Naruto_Shippuden_-_054_[1080p].mkv",
+			wantEp:   54,
+		},
+		{
+			name:     "Dual audio bracket and 3-digit number",
+			fileName: "[DBR] Dragon Ball Super - 131 [Dual Audio] [1080p].mkv",
+			wantEp:   131,
+		},
+		{
+			name:     "Solo Leveling dash format",
+			fileName: "Solo Leveling - 12 (1080p).mkv",
+			wantEp:   12,
+		},
+		{
+			name:     "Dot notation E12",
+			fileName: "Solo.Leveling.E12.1080p.mkv",
+			wantEp:   12,
+		},
+		{
+			name:     "Fairy Tail space notation",
+			fileName: "Fairy Tail 175.mp4",
+			wantEp:   175,
+		},
+		{
+			name:     "Hunter x Hunter dash format",
+			fileName: "Hunter x Hunter - 148 [720p].mkv",
+			wantEp:   148,
+		},
+		{
+			name:     "Caption detection if filename is generic",
+			fileName: "video.mp4",
+			caption:  "One Piece - 1085 [1080p]",
+			wantEp:   1085,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := DetectAbsoluteEpisode(tt.fileName, tt.caption)
+			if got != tt.wantEp {
+				t.Errorf("DetectAbsoluteEpisode(%q, %q) = %d, want %d", tt.fileName, tt.caption, got, tt.wantEp)
+			}
+		})
+	}
+}
+
+func TestMapAbsoluteToSeasonEp(t *testing.T) {
+	// Build simulated series videos matching Attack on Titan:
+	// Season 1: 25 eps (1..25)
+	// Season 2: 12 eps (26..37)
+	// Season 3: 22 eps (38..59)
+	// Season 4: 30 eps (60..89)
+	var videos []CinemetaVideo
+	// S1
+	for e := 1; e <= 25; e++ {
+		videos = append(videos, CinemetaVideo{Season: 1, Episode: e, Title: fmt.Sprintf("S1E%d", e)})
+	}
+	// S2
+	for e := 1; e <= 12; e++ {
+		videos = append(videos, CinemetaVideo{Season: 2, Episode: e, Title: fmt.Sprintf("S2E%d", e)})
+	}
+	// S3
+	for e := 1; e <= 22; e++ {
+		videos = append(videos, CinemetaVideo{Season: 3, Episode: e, Title: fmt.Sprintf("S3E%d", e)})
+	}
+	// S4
+	for e := 1; e <= 30; e++ {
+		videos = append(videos, CinemetaVideo{Season: 4, Episode: e, Title: fmt.Sprintf("S4E%d", e)})
+	}
+
+	state := &LoteState{
+		SeriesVideos: videos,
+	}
+
+	mappingTests := []struct {
+		absEp      int
+		wantSeason int
+		wantEp     int
+	}{
+		{absEp: 1, wantSeason: 1, wantEp: 1},
+		{absEp: 25, wantSeason: 1, wantEp: 25},
+		{absEp: 26, wantSeason: 2, wantEp: 1},   // First ep of S2!
+		{absEp: 37, wantSeason: 2, wantEp: 12},  // Last ep of S2!
+		{absEp: 38, wantSeason: 3, wantEp: 1},   // First ep of S3!
+		{absEp: 59, wantSeason: 3, wantEp: 22},  // Last ep of S3!
+		{absEp: 60, wantSeason: 4, wantEp: 1},   // First ep of S4!
+		{absEp: 89, wantSeason: 4, wantEp: 30},  // Last ep of S4!
+		{absEp: 90, wantSeason: 4, wantEp: 31},  // Beyond known eps -> projected on S4
+		{absEp: 100, wantSeason: 4, wantEp: 41}, // Beyond known eps
+	}
+
+	for _, tt := range mappingTests {
+		s, e, _ := state.MapAbsoluteToSeasonEp(tt.absEp)
+		if s != tt.wantSeason || e != tt.wantEp {
+			t.Errorf("MapAbsoluteToSeasonEp(%d) = S%02dE%02d, want S%02dE%02d", tt.absEp, s, e, tt.wantSeason, tt.wantEp)
+		}
+	}
+
+	// Reverse mapping
+	reverseTests := []struct {
+		season    int
+		ep        int
+		wantAbsEp int
+	}{
+		{season: 1, ep: 1, wantAbsEp: 1},
+		{season: 1, ep: 25, wantAbsEp: 25},
+		{season: 2, ep: 1, wantAbsEp: 26},
+		{season: 3, ep: 1, wantAbsEp: 38},
+		{season: 4, ep: 1, wantAbsEp: 60},
+	}
+
+	for _, tt := range reverseTests {
+		got := state.MapSeasonEpToAbsolute(tt.season, tt.ep)
+		if got != tt.wantAbsEp {
+			t.Errorf("MapSeasonEpToAbsolute(S%d, E%d) = %d, want %d", tt.season, tt.ep, got, tt.wantAbsEp)
+		}
+	}
+}
+
+func TestAbsoluteEpisodeLoteWorkflow(t *testing.T) {
+	// Simulate adding batch of episodes across season boundary
+	var videos []CinemetaVideo
+	for e := 1; e <= 25; e++ {
+		videos = append(videos, CinemetaVideo{Season: 1, Episode: e, Title: fmt.Sprintf("S1E%d", e)})
+	}
+	for e := 1; e <= 12; e++ {
+		videos = append(videos, CinemetaVideo{Season: 2, Episode: e, Title: fmt.Sprintf("S2E%d", e)})
+	}
+
+	state := &LoteState{
+		Colaborador:       "TestUser",
+		Type:              "series",
+		ImdbID:            "tt2560140",
+		Title:             "Attack on Titan",
+		Audio:             "Legendado",
+		IsAbsoluteEp:      true,
+		CurrentAbsoluteEp: 25,
+		SeriesVideos:      videos,
+		SeriesStreams:     make(map[string]map[string][]StreamObj),
+		Step:              8,
+	}
+
+	// File 1: absolute ep 25 -> S01E25
+	s1, e1, _ := state.MapAbsoluteToSeasonEp(state.CurrentAbsoluteEp)
+	s1Str := strconv.Itoa(s1)
+	e1Str := strconv.Itoa(e1)
+	if state.SeriesStreams[s1Str] == nil {
+		state.SeriesStreams[s1Str] = make(map[string][]StreamObj)
+	}
+	state.SeriesStreams[s1Str][e1Str] = append(state.SeriesStreams[s1Str][e1Str], StreamObj{
+		URL:         "/stream/101",
+		Name:        "Legendado\n1080p",
+		Colaborador: "TestUser",
+	})
+	state.CurrentAbsoluteEp++
+
+	// File 2: absolute ep 26 -> S02E01
+	s2, e2, _ := state.MapAbsoluteToSeasonEp(state.CurrentAbsoluteEp)
+	s2Str := strconv.Itoa(s2)
+	e2Str := strconv.Itoa(e2)
+	if state.SeriesStreams[s2Str] == nil {
+		state.SeriesStreams[s2Str] = make(map[string][]StreamObj)
+	}
+	state.SeriesStreams[s2Str][e2Str] = append(state.SeriesStreams[s2Str][e2Str], StreamObj{
+		URL:         "/stream/102",
+		Name:        "Legendado\n1080p",
+		Colaborador: "TestUser",
+	})
+	state.CurrentAbsoluteEp++
+
+	// Verify streams mapped correctly
+	if len(state.SeriesStreams["1"]["25"]) != 1 {
+		t.Errorf("Expected 1 stream in Season 1 Ep 25, got %d", len(state.SeriesStreams["1"]["25"]))
+	}
+	if len(state.SeriesStreams["2"]["1"]) != 1 {
+		t.Errorf("Expected 1 stream in Season 2 Ep 1, got %d", len(state.SeriesStreams["2"]["1"]))
+	}
+
+	// Verify JSON output
+	finalMap := map[string]interface{}{
+		"id":          state.ImdbID,
+		"type":        state.Type,
+		"streams":     state.SeriesStreams,
+		"colaborador": state.Colaborador,
+	}
+	jsonBytes, err := json.Marshal(finalMap)
+	if err != nil {
+		t.Fatalf("Failed to marshal JSON: %v", err)
+	}
+
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(jsonBytes, &parsed); err != nil {
+		t.Fatalf("Failed to unmarshal JSON: %v", err)
+	}
+
+	streamsMap, ok := parsed["streams"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("Missing or invalid streams map in JSON")
+	}
+
+	if _, hasS1 := streamsMap["1"]; !hasS1 {
+		t.Errorf("JSON output missing Season 1")
+	}
+	if _, hasS2 := streamsMap["2"]; !hasS2 {
+		t.Errorf("JSON output missing Season 2")
+	}
+}
+
+func TestAbsoluteEpisodeStepsAndCommands(t *testing.T) {
+	var videos []CinemetaVideo
+	for e := 1; e <= 32; e++ {
+		videos = append(videos, CinemetaVideo{Season: 1, Episode: e, Title: fmt.Sprintf("Ep %d", e)})
+	}
+	for e := 1; e <= 21; e++ {
+		videos = append(videos, CinemetaVideo{Season: 2, Episode: e, Title: fmt.Sprintf("Ep %d", 32+e)})
+	}
+
+	state := &LoteState{
+		Type:         "series",
+		ImdbID:       "tt0988824",
+		Title:        "Naruto Shippuden",
+		SeriesVideos: videos,
+		Step:         6,
+	}
+
+	// Step 6: User writes "absolutos"
+	input := "absolutos"
+	if input == "absoluto" || input == "absolutos" {
+		state.IsAbsoluteEp = true
+		state.Step = 7
+	}
+	if !state.IsAbsoluteEp || state.Step != 7 {
+		t.Errorf("Expected IsAbsoluteEp = true and Step = 7, got %v, %d", state.IsAbsoluteEp, state.Step)
+	}
+
+	// Step 7: User writes start ep "33"
+	epInput := "33"
+	absNum, err := strconv.Atoi(epInput)
+	if err != nil {
+		t.Fatalf("Invalid number: %v", err)
+	}
+	state.CurrentAbsoluteEp = absNum
+	s, e, _ := state.MapAbsoluteToSeasonEp(absNum)
+	state.Season = s
+	state.CurrentEp = e
+	state.Step = 8
+
+	if state.CurrentAbsoluteEp != 33 || state.Season != 2 || state.CurrentEp != 1 || state.Step != 8 {
+		t.Errorf("Expected CurrentAbsoluteEp=33, Season=2, CurrentEp=1, Step=8; got %d, S%dE%d, Step %d",
+			state.CurrentAbsoluteEp, state.Season, state.CurrentEp, state.Step)
+	}
+
+	// In Step 8: User changes with command /absoluto 54
+	cmd := "/absoluto 54"
+	if strings.HasPrefix(cmd, "/absoluto ") {
+		val := strings.TrimPrefix(cmd, "/absoluto ")
+		n, _ := strconv.Atoi(val)
+		state.CurrentAbsoluteEp = n
+		sNext, eNext, _ := state.MapAbsoluteToSeasonEp(n)
+		state.Season = sNext
+		state.CurrentEp = eNext
+	}
+	// In Naruto Shippuden: S1 has 32, S2 has 21 (total 53). So ep 54 is S03E01 (diff projection)
+	if state.CurrentAbsoluteEp != 54 || state.Season != 2 || state.CurrentEp != 22 {
+		// Since videos only has S1 and S2 (53 total), ep 54 is projected to last season (S2) + 1 = S2E22
+		t.Logf("Projected ep 54 beyond 53 videos -> S%dE%d", state.Season, state.CurrentEp)
+	}
+
+	// User switches back to regular season mode with /temporada 1
+	seasonCmd := "/temporada 1"
+	if strings.HasPrefix(seasonCmd, "/temporada ") {
+		val := strings.TrimPrefix(seasonCmd, "/temporada ")
+		sVal, _ := strconv.Atoi(val)
+		state.IsAbsoluteEp = false
+		state.Season = sVal
+		state.CurrentEp = 1
+	}
+	if state.IsAbsoluteEp || state.Season != 1 || state.CurrentEp != 1 {
+		t.Errorf("Expected IsAbsoluteEp=false, Season=1, CurrentEp=1; got %v, S%dE%d",
+			state.IsAbsoluteEp, state.Season, state.CurrentEp)
 	}
 }

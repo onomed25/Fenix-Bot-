@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,22 +39,32 @@ type CinemetaSearchResult struct {
 	Year string
 }
 
+type CinemetaVideo struct {
+	Season  int    `json:"season"`
+	Episode int    `json:"episode"`
+	Number  int    `json:"number"`
+	Title   string `json:"name"`
+}
+
 type LoteState struct {
-	Step             int // 2: Type, 3: Search, 4: MatchSelection, 5: Audio, 6: Season, 7: StartEp, 8: Files
-	Colaborador      string
-	Type             string // "movie" or "series"
-	ImdbID           string
-	Title            string
-	Audio            string
-	EditingAudio     bool
-	Season           int
-	CurrentEp        int
-	AutoDetectSeason bool
-	AutoDetectEp     bool
-	MovieStreams     []StreamObj
-	SeriesStreams    map[string]map[string][]StreamObj // Season -> Ep -> []StreamObj
-	SearchResults    []CinemetaSearchResult
-	Mutex            sync.Mutex // Per-user lock for processing files & messages
+	Step              int // 2: Type, 3: Search, 4: MatchSelection, 5: Audio, 6: Season, 7: StartEp, 8: Files
+	Colaborador       string
+	Type              string // "movie" or "series"
+	ImdbID            string
+	Title             string
+	Audio             string
+	EditingAudio      bool
+	Season            int
+	CurrentEp         int
+	IsAbsoluteEp      bool
+	CurrentAbsoluteEp int
+	SeriesVideos      []CinemetaVideo
+	AutoDetectSeason  bool
+	AutoDetectEp      bool
+	MovieStreams      []StreamObj
+	SeriesStreams     map[string]map[string][]StreamObj // Season -> Ep -> []StreamObj
+	SearchResults     []CinemetaSearchResult
+	Mutex             sync.Mutex // Per-user lock for processing files & messages
 }
 
 var (
@@ -75,8 +86,17 @@ var (
 	seasonOrdinalRegex    = regexp.MustCompile(`(?i)(?:^|[^a-zA-Z0-9])(\d{1,2})\s*(?:[ªºa]|ª|º)?[\s\.\-_]*temporada(?:[^a-zA-Z0-9]|$)`)
 	seasonWordRegex       = regexp.MustCompile(`(?i)(?:^|[^a-zA-Z0-9])(?:temporada|season|temp\.?)[\s\.\-_:]*S?(\d{1,2})(?:[^a-zA-Z0-9]|$)`)
 	seasonStandaloneRegex = regexp.MustCompile(`(?i)(?:^|[^a-zA-Z0-9])[ST](\d{1,2})(?:[^a-zA-Z0-9]|$)`)
-	epWordRegex           = regexp.MustCompile(`(?i)(?:^|[^a-zA-Z0-9])(?:epis[oó]dio|episode|ep\.?)[\s\.\-_:]*E?(\d{1,3})(?:[^a-zA-Z0-9]|$)`)
-	epStandaloneRegex     = regexp.MustCompile(`(?i)(?:^|[^a-zA-Z0-9])(?:E|EP)[\.\-\_\s]*(\d{1,3})(?:[^a-zA-Z0-9]|$)`)
+	epWordRegex           = regexp.MustCompile(`(?i)(?:^|[^a-zA-Z0-9])(?:epis[oó]dio|episode|ep\.?)[\s\.\-_:]*E?(\d{1,4})(?:[^a-zA-Z0-9]|$)`)
+	epStandaloneRegex     = regexp.MustCompile(`(?i)(?:^|[^a-zA-Z0-9])(?:E|EP)[\.\-\_\s]*(\d{1,4})(?:[^a-zA-Z0-9]|$)`)
+
+	// Absolute episode detection patterns
+	absEpExplicitRegex   = regexp.MustCompile(`(?i)\b(?:epis[oó]dio|episode|ep\.?)\s*E?(\d{1,4})\b`)
+	absEpStandaloneRegex = regexp.MustCompile(`(?i)(?:^|[^a-zA-Z0-9])E(\d{1,4})(?:[^a-zA-Z0-9]|$)`)
+	absEpDashRegex       = regexp.MustCompile(`(?:^|[\s\.\-])-\s*(\d{1,4})(?:[\s\.\-\]]|$)`)
+	absEpPureNumRegex    = regexp.MustCompile(`^\s*(\d{1,4})\s*$`)
+	absEpTrailingRegex   = regexp.MustCompile(`(?:^|[\s\._])(\d{1,4})(?:\s*\[|\s*\(|\s*$)`)
+	cleanTagsRegex       = regexp.MustCompile(`(?i)\b(?:2160p|1080p|720p|480p|360p|4k|2k|8k|x264|x265|h264|h265|hevc|10bit|8bit|aac|flac|mp3|dvdrip|bluray|web-dl|webrip)\b`)
+	extRegex             = regexp.MustCompile(`\.[a-zA-Z0-9]{2,5}$`)
 )
 
 func extractColaborador(u *ext.Update) string {
@@ -212,6 +232,100 @@ func DetectSeasonAndEpisode(fileName, caption string) (season int, episode int, 
 	return season, episode, false
 }
 
+func DetectAbsoluteEpisode(fileName, caption string) int {
+	search := func(text string) int {
+		if text == "" {
+			return 0
+		}
+		// Strip extension
+		cleaned := extRegex.ReplaceAllString(text, "")
+		// Replace underscores with spaces
+		cleaned = strings.ReplaceAll(cleaned, "_", " ")
+		// Remove resolution and codec tags
+		cleaned = cleanTagsRegex.ReplaceAllString(cleaned, " ")
+
+		// 1. Explicit markers: "Episodio 33", "Ep 33", "Episode 1085", "ep.50"
+		if m := absEpExplicitRegex.FindStringSubmatch(cleaned); len(m) > 1 {
+			if val, err := strconv.Atoi(m[1]); err == nil && val > 0 {
+				return val
+			}
+		}
+
+		// 2. Standalone E: " E33 "
+		if m := absEpStandaloneRegex.FindStringSubmatch(cleaned); len(m) > 1 {
+			if val, err := strconv.Atoi(m[1]); err == nil && val > 0 {
+				return val
+			}
+		}
+
+		// 3. Anime dash format: " - 033 ", " - 1085 "
+		if m := absEpDashRegex.FindStringSubmatch(cleaned); len(m) > 1 {
+			if val, err := strconv.Atoi(m[1]); err == nil && val > 0 {
+				return val
+			}
+		}
+
+		// 4. Pure number file: "01", "26", "033"
+		trimmed := strings.TrimSpace(cleaned)
+		if m := absEpPureNumRegex.FindStringSubmatch(trimmed); len(m) > 1 {
+			if val, err := strconv.Atoi(m[1]); err == nil && val > 0 {
+				return val
+			}
+		}
+
+		// 5. Trailing number before brackets or end: "Naruto Shippuden 033"
+		if m := absEpTrailingRegex.FindStringSubmatch(cleaned); len(m) > 1 {
+			if val, err := strconv.Atoi(m[1]); err == nil && val > 0 {
+				if val < 1990 || val > 2029 {
+					return val
+				}
+			}
+		}
+
+		return 0
+	}
+
+	if e := search(fileName); e > 0 {
+		return e
+	}
+	if e := search(caption); e > 0 {
+		return e
+	}
+	return 0
+}
+
+func (s *LoteState) MapAbsoluteToSeasonEp(absEp int) (season, ep int, title string) {
+	if len(s.SeriesVideos) == 0 {
+		if absEp < 1 {
+			absEp = 1
+		}
+		return 1, absEp, ""
+	}
+	if absEp < 1 {
+		absEp = 1
+	}
+	if absEp <= len(s.SeriesVideos) {
+		v := s.SeriesVideos[absEp-1]
+		return v.Season, v.Episode, v.Title
+	}
+	// Beyond known episodes in IMDb (e.g. newly airing): append to last season
+	last := s.SeriesVideos[len(s.SeriesVideos)-1]
+	diff := absEp - len(s.SeriesVideos)
+	return last.Season, last.Episode + diff, ""
+}
+
+func (s *LoteState) MapSeasonEpToAbsolute(season, ep int) int {
+	for i, v := range s.SeriesVideos {
+		if v.Season == season && v.Episode == ep {
+			return i + 1
+		}
+	}
+	if season == 1 {
+		return ep
+	}
+	return 0
+}
+
 func getSearchBackMarkup() *tg.ReplyInlineMarkup {
 	return &tg.ReplyInlineMarkup{
 		Rows: []tg.KeyboardButtonRow{
@@ -280,6 +394,14 @@ func getSkipSeasonMarkup() *tg.ReplyInlineMarkup {
 			{
 				Buttons: []tg.KeyboardButtonClass{
 					&tg.KeyboardButtonCallback{
+						Text: "🔢 Episódios Absolutos",
+						Data: []byte("lote_absolute_ep"),
+					},
+				},
+			},
+			{
+				Buttons: []tg.KeyboardButtonClass{
+					&tg.KeyboardButtonCallback{
 						Text: "⏩ Deixar em branco (Auto-detectar)",
 						Data: []byte("lote_skip_season"),
 					},
@@ -302,7 +424,44 @@ func getSkipSeasonMarkup() *tg.ReplyInlineMarkup {
 }
 
 func sendSeasonPrompt(ctx *ext.Context, u *ext.Update) {
-	sendLoteResponse(ctx, u, "Qual é a temporada do lote? (Ex: 1 ou deixe em branco para detecção automática):", getSkipSeasonMarkup())
+	sendLoteResponse(ctx, u, "Qual é a temporada do lote?\n\n• Digite o número da temporada (Ex: `1`)\n• Clique em **⏩ Deixar em branco** para detecção automática\n• Ou clique em **🔢 Episódios Absolutos** se a série/anime usa numeração contínua sem temporadas no arquivo (o bot converterá para as temporadas do IMDb):", getSkipSeasonMarkup())
+}
+
+func getSkipAbsoluteEpMarkup() *tg.ReplyInlineMarkup {
+	return &tg.ReplyInlineMarkup{
+		Rows: []tg.KeyboardButtonRow{
+			{
+				Buttons: []tg.KeyboardButtonClass{
+					&tg.KeyboardButtonCallback{
+						Text: "⏩ Deixar em branco (Auto-detectar)",
+						Data: []byte("lote_skip_abs_ep"),
+					},
+				},
+			},
+			{
+				Buttons: []tg.KeyboardButtonClass{
+					&tg.KeyboardButtonCallback{
+						Text: "🔙 Voltar (Temporada)",
+						Data: []byte("lote_back_to_season"),
+					},
+					&tg.KeyboardButtonCallback{
+						Text: "❌ Cancelar",
+						Data: []byte("lote_cancelar"),
+					},
+				},
+			},
+		},
+	}
+}
+
+func sendAbsoluteEpPrompt(ctx *ext.Context, u *ext.Update, state *LoteState, numSeasons, totalEps int) error {
+	var info string
+	if numSeasons > 0 && totalEps > 0 {
+		info = fmt.Sprintf("🔢 **Modo Episódios Absolutos ativado!**\n- **Série**: %s (`%s`)\n- **Estrutura IMDb**: **%d temporada(s)** e **%d episódios** cadastrados.\n\nQual é o **número do episódio absoluto inicial**? (Ex: `1` para começar do ep 1, `33` para começar no 33, ou deixe em branco para detecção automática):", state.Title, state.ImdbID, numSeasons, totalEps)
+	} else {
+		info = fmt.Sprintf("🔢 **Modo Episódios Absolutos ativado!**\n- **Série**: %s (`%s`)\n\nQual é o **número do episódio absoluto inicial**? (Ex: `1` ou deixe em branco para detecção automática):", state.Title, state.ImdbID)
+	}
+	return sendLoteResponse(ctx, u, info, getSkipAbsoluteEpMarkup())
 }
 
 func getSkipEpMarkup() *tg.ReplyInlineMarkup {
@@ -432,6 +591,9 @@ func handleVoltar(ctx *ext.Context, u *ext.Update, state *LoteState) {
 		state.EditingAudio = false
 		sendAudioPrompt(ctx, u, state.Title, state.ImdbID, false)
 	case 7:
+		if state.IsAbsoluteEp {
+			state.IsAbsoluteEp = false
+		}
 		state.Step = 6
 		sendSeasonPrompt(ctx, u)
 	case 8:
@@ -447,7 +609,15 @@ func handleVoltar(ctx *ext.Context, u *ext.Update, state *LoteState) {
 		} else {
 			if state.Type == "series" {
 				state.Step = 7
-				sendEpPrompt(ctx, u)
+				if state.IsAbsoluteEp {
+					uniqueSeasons := make(map[int]bool)
+					for _, v := range state.SeriesVideos {
+						uniqueSeasons[v.Season] = true
+					}
+					sendAbsoluteEpPrompt(ctx, u, state, len(uniqueSeasons), len(state.SeriesVideos))
+				} else {
+					sendEpPrompt(ctx, u)
+				}
 			} else {
 				state.Step = 5
 				state.EditingAudio = false
@@ -479,22 +649,44 @@ func getWaitingFilesMarkup(state *LoteState) tg.ReplyMarkupClass {
 	}
 
 	// Series/Anime markup
-	row1 := tg.KeyboardButtonRow{
-		Buttons: []tg.KeyboardButtonClass{
-			&tg.KeyboardButtonCallback{Text: fmt.Sprintf("➕ Temp (S%d)", state.Season+1), Data: []byte("lote_inc_season")},
-		},
-	}
-	if state.Season > 1 {
-		row1.Buttons = append(row1.Buttons, &tg.KeyboardButtonCallback{Text: fmt.Sprintf("➖ Temp (S%d)", state.Season-1), Data: []byte("lote_dec_season")})
-	}
+	var row1 tg.KeyboardButtonRow
+	var row2 tg.KeyboardButtonRow
 
-	row2 := tg.KeyboardButtonRow{
-		Buttons: []tg.KeyboardButtonClass{
-			&tg.KeyboardButtonCallback{Text: fmt.Sprintf("➕ Ep (E%d)", state.CurrentEp+1), Data: []byte("lote_inc_ep")},
-		},
-	}
-	if state.CurrentEp > 1 {
-		row2.Buttons = append(row2.Buttons, &tg.KeyboardButtonCallback{Text: fmt.Sprintf("➖ Ep (E%d)", state.CurrentEp-1), Data: []byte("lote_dec_ep")})
+	if state.IsAbsoluteEp {
+		absNext := state.CurrentAbsoluteEp
+		sNext, eNext, _ := state.MapAbsoluteToSeasonEp(absNext)
+		row1 = tg.KeyboardButtonRow{
+			Buttons: []tg.KeyboardButtonClass{
+				&tg.KeyboardButtonCallback{Text: fmt.Sprintf("➕ Ep Abs (#%d)", absNext+1), Data: []byte("lote_inc_abs_ep")},
+			},
+		}
+		if absNext > 1 {
+			row1.Buttons = append(row1.Buttons, &tg.KeyboardButtonCallback{Text: fmt.Sprintf("➖ Ep Abs (#%d)", absNext-1), Data: []byte("lote_dec_abs_ep")})
+		}
+
+		row2 = tg.KeyboardButtonRow{
+			Buttons: []tg.KeyboardButtonClass{
+				&tg.KeyboardButtonCallback{Text: fmt.Sprintf("🔢 #%d ➔ S%02dE%02d", absNext, sNext, eNext), Data: []byte("lote_info_abs")},
+			},
+		}
+	} else {
+		row1 = tg.KeyboardButtonRow{
+			Buttons: []tg.KeyboardButtonClass{
+				&tg.KeyboardButtonCallback{Text: fmt.Sprintf("➕ Temp (S%d)", state.Season+1), Data: []byte("lote_inc_season")},
+			},
+		}
+		if state.Season > 1 {
+			row1.Buttons = append(row1.Buttons, &tg.KeyboardButtonCallback{Text: fmt.Sprintf("➖ Temp (S%d)", state.Season-1), Data: []byte("lote_dec_season")})
+		}
+
+		row2 = tg.KeyboardButtonRow{
+			Buttons: []tg.KeyboardButtonClass{
+				&tg.KeyboardButtonCallback{Text: fmt.Sprintf("➕ Ep (E%d)", state.CurrentEp+1), Data: []byte("lote_inc_ep")},
+			},
+		}
+		if state.CurrentEp > 1 {
+			row2.Buttons = append(row2.Buttons, &tg.KeyboardButtonCallback{Text: fmt.Sprintf("➖ Ep (E%d)", state.CurrentEp-1), Data: []byte("lote_dec_ep")})
+		}
 	}
 
 	row3 := tg.KeyboardButtonRow{
@@ -578,9 +770,42 @@ func HandleLoteMessage(ctx *ext.Context, u *ext.Update) (bool, error) {
 
 	// If it's a command, let other handlers process it
 	if strings.HasPrefix(text, "/") {
-		if state.Step == 8 && (strings.HasPrefix(text, "/temporada ") || strings.HasPrefix(text, "/episodio ")) {
+		if state.Step == 8 && (strings.HasPrefix(text, "/temporada ") || strings.HasPrefix(text, "/episodio ") || strings.HasPrefix(text, "/absoluto") || strings.HasPrefix(text, "/ep ")) {
 			if state.Type != "series" {
 				sendLoteResponse(ctx, u, "Esta opção só é válida para Séries/Animes.", nil)
+				return true, nil
+			}
+			if strings.HasPrefix(text, "/absoluto") || strings.HasPrefix(text, "/ep ") {
+				valStr := ""
+				if strings.HasPrefix(text, "/absoluto ") {
+					valStr = strings.TrimPrefix(text, "/absoluto ")
+				} else if strings.HasPrefix(text, "/ep ") {
+					valStr = strings.TrimPrefix(text, "/ep ")
+				} else if text == "/absoluto" {
+					if !state.IsAbsoluteEp {
+						activateAbsoluteEpMode(ctx, u, state)
+						return true, nil
+					}
+					sNext, eNext, _ := state.MapAbsoluteToSeasonEp(state.CurrentAbsoluteEp)
+					sendLoteResponse(ctx, u, fmt.Sprintf("🔢 Modo Episódios Absolutos ativo.\nPróximo esperado: **#%d** (Corresponde a **S%02dE%02d** no IMDb).", state.CurrentAbsoluteEp, sNext, eNext), getWaitingFilesMarkup(state))
+					return true, nil
+				}
+				valStr = strings.TrimSpace(valStr)
+				absNum, err := strconv.Atoi(valStr)
+				if err != nil || absNum < 1 {
+					sendLoteResponse(ctx, u, "Número de episódio absoluto inválido. Digite um número positivo: (Ex: `/absoluto 26`)", nil)
+					return true, nil
+				}
+				if len(state.SeriesVideos) == 0 {
+					videos, _ := fetchCinemetaSeriesVideos(state.ImdbID)
+					state.SeriesVideos = videos
+				}
+				state.IsAbsoluteEp = true
+				state.CurrentAbsoluteEp = absNum
+				sNext, eNext, _ := state.MapAbsoluteToSeasonEp(absNum)
+				state.Season = sNext
+				state.CurrentEp = eNext
+				sendLoteResponse(ctx, u, fmt.Sprintf("🔢 Episódio absoluto esperado alterado para **#%d** (Corresponde a **S%02dE%02d** no IMDb).\nPróximo esperado: **S%02dE%02d**.", absNum, sNext, eNext, sNext, eNext), getWaitingFilesMarkup(state))
 				return true, nil
 			}
 			if strings.HasPrefix(text, "/temporada ") {
@@ -590,9 +815,10 @@ func HandleLoteMessage(ctx *ext.Context, u *ext.Update) (bool, error) {
 					sendLoteResponse(ctx, u, "Temporada inválida. Digite um número positivo: (Ex: `/temporada 2`)", nil)
 					return true, nil
 				}
+				state.IsAbsoluteEp = false
 				state.Season = season
 				state.CurrentEp = 1
-				sendLoteResponse(ctx, u, fmt.Sprintf("Temporada alterada para **%d**.\nPróximo episódio esperado: **S%dE%d**.", state.Season, state.Season, state.CurrentEp), getWaitingFilesMarkup(state))
+				sendLoteResponse(ctx, u, fmt.Sprintf("Modo padrão de temporadas ativado.\nTemporada alterada para **%d**.\nPróximo episódio esperado: **S%dE%d**.", state.Season, state.Season, state.CurrentEp), getWaitingFilesMarkup(state))
 				return true, nil
 			}
 			if strings.HasPrefix(text, "/episodio ") {
@@ -600,6 +826,14 @@ func HandleLoteMessage(ctx *ext.Context, u *ext.Update) (bool, error) {
 				ep, err := strconv.Atoi(valStr)
 				if err != nil || ep < 1 {
 					sendLoteResponse(ctx, u, "Episódio inválido. Digite um número positivo: (Ex: `/episodio 5`)", nil)
+					return true, nil
+				}
+				if state.IsAbsoluteEp {
+					state.CurrentAbsoluteEp = ep
+					sNext, eNext, _ := state.MapAbsoluteToSeasonEp(ep)
+					state.Season = sNext
+					state.CurrentEp = eNext
+					sendLoteResponse(ctx, u, fmt.Sprintf("Episódio absoluto atual alterado para **#%d** (Corresponde a **S%02dE%02d** no IMDb).\nPróximo episódio esperado: **S%02dE%02d**.", ep, sNext, eNext, sNext, eNext), getWaitingFilesMarkup(state))
 					return true, nil
 				}
 				state.CurrentEp = ep
@@ -661,6 +895,18 @@ func HandleLoteMessage(ctx *ext.Context, u *ext.Update) (bool, error) {
 			state.ImdbID = text
 			state.Title = title
 			state.SearchResults = nil
+			if state.Type == "series" && state.ImdbID != "" {
+				go func(cid string) {
+					vids, err := fetchCinemetaSeriesVideos(cid)
+					if err == nil && len(vids) > 0 {
+						state.Mutex.Lock()
+						if state.ImdbID == cid && len(state.SeriesVideos) == 0 {
+							state.SeriesVideos = vids
+						}
+						state.Mutex.Unlock()
+					}
+				}(state.ImdbID)
+			}
 			state.Step = 5
 			sendAudioPrompt(ctx, u, state.Title, state.ImdbID, false)
 		} else {
@@ -689,6 +935,18 @@ func HandleLoteMessage(ctx *ext.Context, u *ext.Update) (bool, error) {
 			state.ImdbID = text
 			state.Title = title
 			state.SearchResults = nil
+			if state.Type == "series" && state.ImdbID != "" {
+				go func(cid string) {
+					vids, err := fetchCinemetaSeriesVideos(cid)
+					if err == nil && len(vids) > 0 {
+						state.Mutex.Lock()
+						if state.ImdbID == cid && len(state.SeriesVideos) == 0 {
+							state.SeriesVideos = vids
+						}
+						state.Mutex.Unlock()
+					}
+				}(state.ImdbID)
+			}
 			state.Step = 5
 			sendAudioPrompt(ctx, u, state.Title, state.ImdbID, false)
 			return true, nil
@@ -699,6 +957,18 @@ func HandleLoteMessage(ctx *ext.Context, u *ext.Update) (bool, error) {
 			selected := state.SearchResults[idx-1]
 			state.ImdbID = selected.ID
 			state.Title = selected.Name
+			if state.Type == "series" && state.ImdbID != "" {
+				go func(cid string) {
+					vids, err := fetchCinemetaSeriesVideos(cid)
+					if err == nil && len(vids) > 0 {
+						state.Mutex.Lock()
+						if state.ImdbID == cid && len(state.SeriesVideos) == 0 {
+							state.SeriesVideos = vids
+						}
+						state.Mutex.Unlock()
+					}
+				}(state.ImdbID)
+			}
 			state.Step = 5
 			sendAudioPrompt(ctx, u, state.Title, state.ImdbID, false)
 			return true, nil
@@ -757,6 +1027,10 @@ func HandleLoteMessage(ctx *ext.Context, u *ext.Update) (bool, error) {
 
 	case 6: // Season
 		lower := strings.ToLower(text)
+		if lower == "absoluto" || lower == "absolutos" || lower == "ep absoluto" || lower == "ep absolutos" || lower == "episodios absolutos" || lower == "episodio absoluto" || lower == "ep abisolutos" {
+			activateAbsoluteEpMode(ctx, u, state)
+			return true, nil
+		}
 		if text == "" || lower == "pular" || lower == "skip" || lower == "auto" || lower == "deixar em branco" || lower == "em branco" || text == "-" || text == "0" {
 			state.AutoDetectSeason = true
 			state.Season = 1
@@ -776,6 +1050,37 @@ func HandleLoteMessage(ctx *ext.Context, u *ext.Update) (bool, error) {
 		return true, nil
 
 	case 7: // Start ep
+		if state.IsAbsoluteEp {
+			lower := strings.ToLower(text)
+			if text == "" || lower == "pular" || lower == "skip" || lower == "auto" || lower == "deixar em branco" || lower == "em branco" || text == "-" || text == "0" {
+				state.AutoDetectEp = true
+				state.CurrentAbsoluteEp = 1
+				sNext, eNext, _ := state.MapAbsoluteToSeasonEp(1)
+				state.Season = sNext
+				state.CurrentEp = eNext
+				state.SeriesStreams = make(map[string]map[string][]StreamObj)
+				state.Step = 8
+				msgStr := fmt.Sprintf("✅ **Configurações Concluídas!**\n\n- **Colaborador**: %s\n- **Tipo**: Série (Episódios Absolutos)\n- **Título**: %s (%s)\n- **Áudio**: %s\n- **Episódio Inicial**: Automático (detectado do arquivo)\n\nAgora, **envie os arquivos de vídeo**.\nQuando terminar, envie `/concluido`.", state.Colaborador, state.Title, state.ImdbID, state.Audio)
+				sendLoteResponse(ctx, u, msgStr, getWaitingFilesMarkup(state))
+				return true, nil
+			}
+			absNum, err := strconv.Atoi(text)
+			if err != nil || absNum < 1 {
+				sendLoteResponse(ctx, u, "Episódio absoluto inválido. Digite um número positivo (ou clique abaixo para detectar automaticamente):", getSkipAbsoluteEpMarkup())
+				return true, nil
+			}
+			state.CurrentAbsoluteEp = absNum
+			state.AutoDetectEp = false
+			sNext, eNext, _ := state.MapAbsoluteToSeasonEp(absNum)
+			state.Season = sNext
+			state.CurrentEp = eNext
+			state.SeriesStreams = make(map[string]map[string][]StreamObj)
+			state.Step = 8
+			msgStr := fmt.Sprintf("✅ **Configurações Concluídas!**\n\n- **Colaborador**: %s\n- **Tipo**: Série (Episódios Absolutos)\n- **Título**: %s (%s)\n- **Áudio**: %s\n- **Episódio Absoluto Inicial**: #%d (S%02dE%02d no IMDb)\n\nAgora, **envie os arquivos de vídeo em ordem**.\nQuando terminar, envie `/concluido`.", state.Colaborador, state.Title, state.ImdbID, state.Audio, state.CurrentAbsoluteEp, sNext, eNext)
+			sendLoteResponse(ctx, u, msgStr, getWaitingFilesMarkup(state))
+			return true, nil
+		}
+
 		lower := strings.ToLower(text)
 		if text == "" || lower == "pular" || lower == "skip" || lower == "auto" || lower == "deixar em branco" || lower == "em branco" || text == "-" || text == "0" {
 			state.AutoDetectEp = true
@@ -831,6 +1136,64 @@ func HandleLoteMessage(ctx *ext.Context, u *ext.Update) (bool, error) {
 		if state.Type == "movie" {
 			state.MovieStreams = append(state.MovieStreams, streamObj)
 			sendLoteResponse(ctx, u, fmt.Sprintf("🎬 Link de filme adicionado!\n- **Nome**: %s\n- **Qualidade**: %s\n- **URL**: %s\n\nEnvie outro arquivo ou clique em **Concluir Lote**.", fileName, quality, link), getWaitingFilesMarkup(state))
+		} else if state.IsAbsoluteEp {
+			caption := ""
+			if u.EffectiveMessage != nil {
+				caption = u.EffectiveMessage.Text
+			}
+
+			absNum := 0
+			// First check if filename has explicit SxxExx
+			detSeason, detEp, _ := DetectSeasonAndEpisode(fileName, caption)
+			if detSeason > 0 && detEp > 0 {
+				mappedAbs := state.MapSeasonEpToAbsolute(detSeason, detEp)
+				if mappedAbs > 0 {
+					absNum = mappedAbs
+				}
+			}
+
+			if absNum == 0 {
+				if state.AutoDetectEp {
+					detAbs := DetectAbsoluteEpisode(fileName, caption)
+					if detAbs > 0 {
+						absNum = detAbs
+					} else {
+						absNum = state.CurrentAbsoluteEp
+					}
+				} else {
+					absNum = state.CurrentAbsoluteEp
+				}
+			}
+
+			if absNum < 1 {
+				absNum = 1
+			}
+
+			season, ep, epTitle := state.MapAbsoluteToSeasonEp(absNum)
+
+			seasonStr := strconv.Itoa(season)
+			epStr := strconv.Itoa(ep)
+
+			if state.SeriesStreams == nil {
+				state.SeriesStreams = make(map[string]map[string][]StreamObj)
+			}
+			if state.SeriesStreams[seasonStr] == nil {
+				state.SeriesStreams[seasonStr] = make(map[string][]StreamObj)
+			}
+			state.SeriesStreams[seasonStr][epStr] = append(state.SeriesStreams[seasonStr][epStr], streamObj)
+
+			state.CurrentAbsoluteEp = absNum + 1
+			nextAbs := state.CurrentAbsoluteEp
+			nextS, nextE, _ := state.MapAbsoluteToSeasonEp(nextAbs)
+			state.Season = nextS
+			state.CurrentEp = nextE
+
+			titleLine := ""
+			if epTitle != "" {
+				titleLine = fmt.Sprintf("\n- **Título IMDb**: %s", epTitle)
+			}
+
+			sendLoteResponse(ctx, u, fmt.Sprintf("📺 **S%02dE%02d** (Ep. Absoluto #%d) adicionado!\n- **Temporada**: %d\n- **Episódio**: %d\n- **Ep. Absoluto**: %d%s\n- **Nome**: %s\n- **Qualidade**: %s\n- **URL**: %s\n\nPróximo esperado: **#%d (S%02dE%02d)**.\nEnvie outro arquivo ou clique em **Concluir Lote**.", season, ep, absNum, season, ep, absNum, titleLine, fileName, quality, link, nextAbs, nextS, nextE), getWaitingFilesMarkup(state))
 		} else {
 			season := state.Season
 			ep := state.CurrentEp
@@ -840,21 +1203,19 @@ func HandleLoteMessage(ctx *ext.Context, u *ext.Update) (bool, error) {
 				caption = u.EffectiveMessage.Text
 			}
 
-			if state.AutoDetectSeason || state.AutoDetectEp {
-				detSeason, detEp, isChapter := DetectSeasonAndEpisode(fileName, caption)
-				if isChapter {
-					// Chapter exception: Force season 1, ignore multiple seasons
-					season = 1
-					if detEp > 0 {
-						ep = detEp
-					}
-				} else {
-					if state.AutoDetectSeason && detSeason > 0 {
-						season = detSeason
-					}
-					if detEp > 0 {
-						ep = detEp
-					}
+			detSeason, detEp, isChapter := DetectSeasonAndEpisode(fileName, caption)
+			if isChapter {
+				// Chapter exception: Force season 1, ignore multiple seasons
+				season = 1
+				if detEp > 0 {
+					ep = detEp
+				}
+			} else {
+				if detSeason > 0 {
+					season = detSeason
+				}
+				if detEp > 0 {
+					ep = detEp
 				}
 			}
 
@@ -1152,7 +1513,15 @@ func handleLoteCallbackQuery(ctx *ext.Context, u *ext.Update) error {
 			if state.Type == "series" {
 				if len(state.SeriesStreams) == 0 {
 					state.Step = 7
-					sendEpPrompt(ctx, u)
+					if state.IsAbsoluteEp {
+						uniqueSeasons := make(map[int]bool)
+						for _, v := range state.SeriesVideos {
+							uniqueSeasons[v.Season] = true
+						}
+						sendAbsoluteEpPrompt(ctx, u, state, len(uniqueSeasons), len(state.SeriesVideos))
+					} else {
+						sendEpPrompt(ctx, u)
+					}
 				} else {
 					sendLoteResponse(ctx, u, "Já existem arquivos adicionados. Para alterar o áudio, clique em **🔊 Alterar Áudio**.", getWaitingFilesMarkup(state))
 				}
@@ -1181,6 +1550,18 @@ func handleLoteCallbackQuery(ctx *ext.Context, u *ext.Update) error {
 			if found {
 				state.ImdbID = selected.ID
 				state.Title = selected.Name
+				if state.Type == "series" && state.ImdbID != "" {
+					go func(cid string) {
+						vids, err := fetchCinemetaSeriesVideos(cid)
+						if err == nil && len(vids) > 0 {
+							state.Mutex.Lock()
+							if state.ImdbID == cid && len(state.SeriesVideos) == 0 {
+								state.SeriesVideos = vids
+							}
+							state.Mutex.Unlock()
+						}
+					}(state.ImdbID)
+				}
 				state.Step = 5
 				sendAudioPrompt(ctx, u, state.Title, state.ImdbID, false)
 			}
@@ -1211,12 +1592,28 @@ func handleLoteCallbackQuery(ctx *ext.Context, u *ext.Update) error {
 				sendLoteResponse(ctx, u, msgStr, getWaitingFilesMarkup(state))
 			}
 		}
+	case data == "lote_absolute_ep":
+		if state.Step == 6 {
+			activateAbsoluteEpMode(ctx, u, state)
+		}
 	case data == "lote_skip_season":
 		if state.Step == 6 {
 			state.AutoDetectSeason = true
 			state.Season = 1
 			state.Step = 7
 			sendEpPrompt(ctx, u)
+		}
+	case data == "lote_skip_abs_ep":
+		if state.Step == 7 && state.IsAbsoluteEp {
+			state.AutoDetectEp = true
+			state.CurrentAbsoluteEp = 1
+			sNext, eNext, _ := state.MapAbsoluteToSeasonEp(1)
+			state.Season = sNext
+			state.CurrentEp = eNext
+			state.SeriesStreams = make(map[string]map[string][]StreamObj)
+			state.Step = 8
+			msgStr := fmt.Sprintf("✅ **Configurações Concluídas!**\n\n- **Colaborador**: %s\n- **Tipo**: Série (Episódios Absolutos)\n- **Título**: %s (%s)\n- **Áudio**: %s\n- **Episódio Inicial**: Automático (detectado do arquivo)\n\nAgora, **envie os arquivos de vídeo**.\nQuando terminar, envie `/concluido`.", state.Colaborador, state.Title, state.ImdbID, state.Audio)
+			sendLoteResponse(ctx, u, msgStr, getWaitingFilesMarkup(state))
 		}
 	case data == "lote_skip_ep":
 		if state.Step == 7 {
@@ -1253,6 +1650,32 @@ func handleLoteCallbackQuery(ctx *ext.Context, u *ext.Update) error {
 			state.CurrentEp--
 			sendLoteResponse(ctx, u, fmt.Sprintf("Próximo episódio esperado alterado para **%d**.\nEsperado: **S%dE%d**.", state.CurrentEp, state.Season, state.CurrentEp), getWaitingFilesMarkup(state))
 		}
+	case data == "lote_inc_abs_ep":
+		state.CurrentAbsoluteEp++
+		sNext, eNext, _ := state.MapAbsoluteToSeasonEp(state.CurrentAbsoluteEp)
+		state.Season = sNext
+		state.CurrentEp = eNext
+		sendLoteResponse(ctx, u, fmt.Sprintf("Próximo episódio absoluto alterado para **#%d**.\nEsperado: **S%02dE%02d** no IMDb.", state.CurrentAbsoluteEp, sNext, eNext), getWaitingFilesMarkup(state))
+	case data == "lote_dec_abs_ep":
+		if state.CurrentAbsoluteEp > 1 {
+			state.CurrentAbsoluteEp--
+			sNext, eNext, _ := state.MapAbsoluteToSeasonEp(state.CurrentAbsoluteEp)
+			state.Season = sNext
+			state.CurrentEp = eNext
+			sendLoteResponse(ctx, u, fmt.Sprintf("Próximo episódio absoluto alterado para **#%d**.\nEsperado: **S%02dE%02d** no IMDb.", state.CurrentAbsoluteEp, sNext, eNext), getWaitingFilesMarkup(state))
+		}
+	case data == "lote_info_abs":
+		sNext, eNext, t := state.MapAbsoluteToSeasonEp(state.CurrentAbsoluteEp)
+		msg := fmt.Sprintf("Episódio #%d corresponde a S%02dE%02d no IMDb", state.CurrentAbsoluteEp, sNext, eNext)
+		if t != "" {
+			msg += ": " + t
+		}
+		ctx.AnswerCallback(&tg.MessagesSetBotCallbackAnswerRequest{
+			Alert:   true,
+			QueryID: query.QueryID,
+			Message: msg,
+		})
+		return nil
 	}
 
 	return nil
@@ -1499,6 +1922,103 @@ func fetchCinemetaDetails(contentType, imdbID string) (string, error) {
 	}
 
 	return result.Meta.Name, nil
+}
+
+func activateAbsoluteEpMode(ctx *ext.Context, u *ext.Update, state *LoteState) error {
+	if len(state.SeriesVideos) == 0 {
+		videos, err := fetchCinemetaSeriesVideos(state.ImdbID)
+		if err != nil || len(videos) == 0 {
+			utils.Logger.Sugar().Warnf("Failed to fetch Cinemeta series videos for %s: %v", state.ImdbID, err)
+		} else {
+			state.SeriesVideos = videos
+		}
+	}
+
+	uniqueSeasons := make(map[int]bool)
+	for _, v := range state.SeriesVideos {
+		uniqueSeasons[v.Season] = true
+	}
+	numSeasons := len(uniqueSeasons)
+	totalEps := len(state.SeriesVideos)
+
+	state.IsAbsoluteEp = true
+	state.Step = 7
+	return sendAbsoluteEpPrompt(ctx, u, state, numSeasons, totalEps)
+}
+
+func fetchCinemetaSeriesVideos(imdbID string) ([]CinemetaVideo, error) {
+	apiURL := fmt.Sprintf("https://v3-cinemeta.strem.io/meta/series/%s.json", imdbID)
+
+	client := &http.Client{}
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %s", resp.Status)
+	}
+
+	var result struct {
+		Meta struct {
+			Videos []struct {
+				Season  int    `json:"season"`
+				Episode int    `json:"episode"`
+				Number  int    `json:"number"`
+				Name    string `json:"name"`
+			} `json:"videos"`
+		} `json:"meta"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	type seKey struct {
+		s int
+		e int
+	}
+	seen := make(map[seKey]bool)
+	var list []CinemetaVideo
+
+	for _, v := range result.Meta.Videos {
+		if v.Season <= 0 {
+			continue
+		}
+		ep := v.Episode
+		if ep == 0 {
+			ep = v.Number
+		}
+		if ep <= 0 {
+			continue
+		}
+		k := seKey{s: v.Season, e: ep}
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		list = append(list, CinemetaVideo{
+			Season:  v.Season,
+			Episode: ep,
+			Title:   v.Name,
+		})
+	}
+
+	sort.Slice(list, func(i, j int) bool {
+		if list[i].Season != list[j].Season {
+			return list[i].Season < list[j].Season
+		}
+		return list[i].Episode < list[j].Episode
+	})
+
+	return list, nil
 }
 
 func uploadToFenixFlix(apiURL, imdbID, jsonContent, password string) error {
